@@ -1,0 +1,36 @@
+name: Linux Virtual Transport
+
+on:
+  push:
+    branches: [ "master", "dev" ]
+  pull_request:
+    branches: [ "master", "dev" ]
+    types: [opened, synchronize, reopened]
+
+jobs:
+  build:
+    strategy:
+        matrix:
+            virtual_transport: [ON, OFF]
+    name: ENABLE_VIRTUAL_TRANSPORT ${{ matrix.virtual_transport }}
+    runs-on: ubuntu-latest
+    steps:
+
+    - uses: actions/checkout@v3
+
+    - name: prepare
+      run: ./scripts/workflows/build/ubuntu-prepare-environment.sh
+
+    - name: configure
+      run: >
+        ./scripts/workflows/build/configure.sh _build -std 17 -werror on
+        -ut on -bonding on -- -DENABLE_VIRTUAL_TRANSPORT=${{ matrix.virtual_transport }}
+
+    - name: build
+      run: ./scripts/workflows/build/build.sh _build
+
+    - name: test
+      # The feature tests (VirtualTransport, TransportQueue) exist only in
+      # the ON build; in the OFF build the same selection runs the
+      # stock-build guard tests (TestVirtualTransportStock).
+      run: cd _build && ctest --output-on-failure -R "VirtualTransport|TransportQueue" -j 2
