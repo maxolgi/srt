@@ -791,6 +791,84 @@ SRT_API       SRTSOCKET srt_connect_bind (SRTSOCKET u, const struct sockaddr* so
 SRT_API       SRTSTATUS srt_rendezvous   (SRTSOCKET u, const struct sockaddr* local_name, int local_namelen,
                                     const struct sockaddr* remote_name, int remote_namelen);
 
+//
+// Virtual transport types.
+//
+// A virtual transport replaces the OS UDP socket of a socket's channel:
+// SRT hands outgoing datagrams over to an owner-supplied send callback and
+// receives incoming datagrams through an owner-supplied waitread/deliver
+// callback pair, mirroring how a UDP channel uses sendto/select/recvmsg.
+// These types are declared in every build; a socket actually exchanges
+// datagrams through a virtual transport only in builds with
+// ENABLE_VIRTUAL_TRANSPORT. All settings of a virtual transport connection
+// are carried exclusively by SRT_VirtualTransportConfig - they have no
+// socket option counterparts.
+//
+
+// One buffer of a datagram passed through a virtual transport, in the
+// iovec spirit: a pointer to the data and the size of the data. For the
+// send callback the buffers belong to SRT and must not be modified by the
+// owner; for the deliver callback they are the target buffers supplied by
+// SRT for the owner to write the incoming datagram into.
+typedef struct SRT_VTBuf_
+{
+    char* data; // pointer to the buffer's data
+    int   len;  // size of the buffer's data, in bytes
+} SRT_VTBUF;
+
+// The result of the waitread callback - the virtual transport's
+// equivalent of the readiness report of select() on a UDP socket.
+typedef enum SRT_VTWait_
+{
+    SRT_VTWAIT_READY  =  0, // a datagram is ready to be picked by deliver()
+    SRT_VTWAIT_TIMEOUT = 1, // no datagram within the given time; call again
+    SRT_VTWAIT_BROKEN  = -1 // the medium is broken; the connection will be terminated
+} SRT_VTWAIT;
+
+// Send callback: invoked by SRT whenever an outgoing datagram is to be
+// delivered to the medium. It may be called from internal SRT threads. The
+// datagram is passed as an array of buffer entries (normally two: the
+// packet header block and the payload block) - the entries are received
+// scattered, with no gathering and no copying expected. The buffers are
+// owned by SRT and valid only for the duration of the call. It must return
+// the number of bytes accepted, or -1 if this datagram failed. Sending is
+// UDP-like fire-and-forget: SRT does not retry a datagram rejected with
+// -1; a broken medium is not signaled here - it surfaces through
+// waitread().
+typedef int SRT_VirtualTransportSendFunc(void* opaq, const struct sockaddr* dst, int dstlen,
+                                         const SRT_VTBUF* vec, int nvec);
+
+// Wait callback: replaces the select() call on a UDP socket. It must
+// return after at most timeout_ms milliseconds with the readiness state of
+// the medium. SRT_VTWAIT_BROKEN reports that the medium can no longer
+// carry datagrams; this terminates the receive worker and thereby breaks
+// the connection.
+typedef SRT_VTWAIT SRT_VirtualTransportWaitReadFunc(void* opaq, int timeout_ms);
+
+// Deliver callback: invoked by SRT only after waitread returned
+// SRT_VTWAIT_READY, to pick up one pending datagram. The datagram is
+// scattered into the provided buffer entries (normally two: the packet
+// header buffer and the payload buffer, as with recvmsg()); the source
+// address of the datagram is written to w_src with its length in
+// *w_srclen (the input value is the buffer capacity). It must return the
+// total number of bytes written, or -1 on error - the datagram is then
+// discarded and SRT reads on (like a temporary recvmsg() error).
+typedef int SRT_VirtualTransportDeliverFunc(void* opaq, struct sockaddr* w_src, int* w_srclen,
+                                            SRT_VTBUF* w_vec, int nvec);
+
+// Configuration of a virtual transport: the three callbacks, the opaque
+// value passed back to every callback, and the settings of the connection
+// (they are not settable on a socket).
+typedef struct SRT_VirtualTransportConfig_
+{
+    SRT_VirtualTransportSendFunc*     send;           // hands an outgoing datagram over to the medium
+    SRT_VirtualTransportWaitReadFunc* waitread;       // waits for an incoming datagram to become ready
+    SRT_VirtualTransportDeliverFunc*  deliver;        // picks up one incoming datagram
+    void*                             opaq;           // opaque value passed through to every callback
+    int                               initial_rtt_ms; // initial RTT to assume (0 = disabled, otherwise 1..30000)
+    int                               skip_induction; // 0/1: skip the induction phase of the handshake
+} SRT_VirtualTransportConfig;
+
 SRT_API       SRTSTATUS srt_close        (SRTSOCKET u);
 SRT_API       SRTSTATUS srt_close_withreason(SRTSOCKET u, int reason);
 SRT_API       SRTSTATUS srt_close_getreason(SRTSOCKET u, SRT_CLOSE_INFO* info);

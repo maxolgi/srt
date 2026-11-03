@@ -105,6 +105,13 @@ public:
 
     virtual EReadStatus recvfrom(sockaddr_any& addr, CPacket& packet) const = 0;
 
+    /// Query the medium type of the channel.
+    /// @return true if the channel exchanges datagrams through a
+    /// virtual transport (CChannelVirtual), false when it is backed
+    /// by an OS UDP socket (CChannelUDP).
+
+    virtual bool isVirtual() const { return false; }
+
     virtual void setConfig(const CSrtMuxerConfig& config) = 0;
 
     /// Get the IP TTL.
@@ -319,6 +326,55 @@ private:
 
 #endif //SRT_ENABLE_PKTINFO
 
+};
+
+// Virtual transport implementation of the CChannel interface: the OS UDP
+// socket is replaced with the callbacks supplied in
+// SRT_VirtualTransportConfig. Outgoing datagrams are handed over to the
+// send callback in the network byte order, as separate header and payload
+// blocks; incoming datagrams are awaited with the waitread callback and
+// picked up with the deliver callback. The class is compiled
+// unconditionally so that API drift is caught in every build; only its
+// construction is gated by ENABLE_VIRTUAL_TRANSPORT (CMultiplexer::configure).
+class CChannelVirtual: public CChannel
+{
+public:
+    /// Open a virtual transport channel.
+    /// @param [in] cfg callbacks and settings of the virtual transport,
+    /// copied by value.
+    /// @param [in] label The local address that the channel reports.
+
+    CChannelVirtual(const SRT_VirtualTransportConfig& cfg, const sockaddr_any& label);
+
+    void close();
+    void stop();
+
+    sockaddr_any getSockAddr() const;
+
+    int sendto(const sockaddr_any& addr, CPacket& packet, const CNetworkInterface& src) const;
+    EReadStatus recvfrom(sockaddr_any& addr, CPacket& packet) const;
+
+    void setConfig(const CSrtMuxerConfig& config);
+
+    int getIpTTL() const;
+    int getIpToS() const;
+
+#ifdef SRT_ENABLE_BINDTODEVICE
+    bool getBind(char* dst, size_t len) const;
+#endif
+
+    const sockaddr_any& bindAddressAny();
+
+    bool isVirtual() const { return true; }
+
+private:
+    SRT_VirtualTransportConfig m_VTConfig; // Copied by value in the constructor.
+    sockaddr_any m_Label; // The local address reported by getSockAddr().
+
+    // Set by close()/stop() from a thread other than the receive worker,
+    // and when the medium reports itself broken; makes recvfrom() return
+    // RST_ERROR so that the receive worker exits.
+    mutable sync::atomic<bool> m_bBroken;
 };
 
 } // namespace srt

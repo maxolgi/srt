@@ -221,6 +221,7 @@ std::string PacketMessageFlagStr(uint32_t msgno_field);
 class CPacket
 {
     friend class CChannelUDP;
+    friend class CChannelVirtual;
     friend class CSndQueue;
     friend class CRcvQueue;
 

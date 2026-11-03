@@ -1246,4 +1246,159 @@ Return_error:
     return status;
 }
 
+CChannelVirtual::CChannelVirtual(const SRT_VirtualTransportConfig& cfg, const sockaddr_any& label)
+    : m_VTConfig(cfg)
+    , m_Label(label)
+    , m_bBroken(false)
+{
+    LOGC(kmlog.Debug, log << "CHANNEL: VIRTUAL transport opened, local address: " << m_Label.str());
+}
+
+void CChannelVirtual::close()
+{
+    // There is no OS entity to release and the callbacks are owned by the
+    // transport owner; just make sure no callback is used anymore.
+    m_bBroken = true;
+}
+
+void CChannelVirtual::stop()
+{
+    // Like shutdown() on the OS socket in the UDP channel: makes the next
+    // recvfrom() call return RST_ERROR so that the receive worker exits
+    // promptly. The waiting granularity of recvfrom() bounds the delay.
+    m_bBroken = true;
+}
+
+sockaddr_any CChannelVirtual::getSockAddr() const
+{
+    // No OS socket to query; report the address the channel was opened with.
+    return m_Label;
+}
+
+int CChannelVirtual::sendto(const sockaddr_any& addr, CPacket& packet, const CNetworkInterface& src_ni SRT_ATR_UNUSED) const
+{
+    HLOGC(kslog.Debug,
+          log << "CChannelVirtual::sendto: SENDING NOW DST=" << addr.str() << " target=@" << packet.id()
+              << " size=" << packet.getLength() << " pkt.ts=" << packet.timestamp() << " " << packet.Info());
+
+    // The wire bytes must be identical with the UDP channel, so the packet
+    // is handed over in the network byte order, exactly as it goes to
+    // ::sendmsg. The header block and the payload block are passed as
+    // separate buffer entries - no gathering, no copying.
+    packet.toNetworkByteOrder();
+
+    SRT_VTBUF vec[CPacket::PV_SIZE];
+    vec[CPacket::PV_HEADER].data = packet.m_PacketVector[CPacket::PV_HEADER].data();
+    vec[CPacket::PV_HEADER].len  = (int) CPacket::HDR_SIZE;
+    vec[CPacket::PV_DATA].data   = packet.m_PacketVector[CPacket::PV_DATA].data();
+    vec[CPacket::PV_DATA].len    = (int) packet.getLength();
+
+    const int res = m_VTConfig.send(m_VTConfig.opaq, addr.get(), addr.size(), vec, CPacket::PV_SIZE);
+
+    packet.toHostByteOrder();
+
+    // UDP-like fire-and-forget: the number of bytes accepted (or -1 if the
+    // datagram failed) is only passed through; SRT does not retry.
+    return res;
+}
+
+EReadStatus CChannelVirtual::recvfrom(sockaddr_any& w_addr, CPacket& w_packet) const
+{
+    // The same waiting granularity as the select() call in
+    // CChannelUDP::recvfrom; it also bounds the time after which the
+    // receive worker notices that stop() was called.
+    static const int WAIT_GRANULARITY_MS = 10;
+
+    if (m_bBroken)
+    {
+        w_packet.setLength(-1);
+        return RST_ERROR;
+    }
+
+    const SRT_VTWAIT wt = m_VTConfig.waitread(m_VTConfig.opaq, WAIT_GRANULARITY_MS);
+
+    if (wt == SRT_VTWAIT_TIMEOUT)
+    {
+        w_packet.setLength(-1);
+        return RST_AGAIN;
+    }
+
+    if (wt != SRT_VTWAIT_READY)
+    {
+        // SRT_VTWAIT_BROKEN: the medium can no longer carry datagrams.
+        // Like an unrecoverable recvmsg() error in the UDP channel, this
+        // makes the receive worker exit, which breaks the connection.
+        m_bBroken = true;
+        w_packet.setLength(-1);
+        return RST_ERROR;
+    }
+
+    // The buffers that recvmsg() in the UDP channel would scatter the
+    // datagram into: the packet's header buffer and payload buffer.
+    SRT_VTBUF vec[CPacket::PV_SIZE];
+    vec[CPacket::PV_HEADER].data = w_packet.m_PacketVector[CPacket::PV_HEADER].data();
+    vec[CPacket::PV_HEADER].len  = (int) w_packet.m_PacketVector[CPacket::PV_HEADER].size();
+    vec[CPacket::PV_DATA].data   = w_packet.m_PacketVector[CPacket::PV_DATA].data();
+    vec[CPacket::PV_DATA].len    = (int) w_packet.m_PacketVector[CPacket::PV_DATA].size();
+
+    int srclen = w_addr.size();
+    const int recv_size = m_VTConfig.deliver(m_VTConfig.opaq, w_addr.get(), (&srclen), vec, CPacket::PV_SIZE);
+
+    if (recv_size == -1)
+    {
+        // The transport discarded the datagram; treated like a temporary
+        // recvmsg() error: the datagram is lost, reading continues.
+        w_packet.setLength(-1);
+        return RST_AGAIN;
+    }
+
+    // From here on, mirror the recvmsg() path of CChannelUDP::recvfrom.
+
+    // Sanity check for a case when it didn't fill in even the header
+    if (size_t(recv_size) < CPacket::HDR_SIZE)
+    {
+        HLOGC(krlog.Debug,
+              log << CONID() << "POSSIBLE ATTACK: received too short packet with " << recv_size << " bytes");
+        w_packet.setLength(-1);
+        return RST_AGAIN;
+    }
+
+    w_packet.setLength(recv_size - CPacket::HDR_SIZE);
+    w_packet.toHostByteOrder();
+
+    return RST_OK;
+}
+
+void CChannelVirtual::setConfig(const CSrtMuxerConfig& config SRT_ATR_UNUSED)
+{
+    // All settings of a virtual transport connection live in the
+    // SRT_VirtualTransportConfig passed to the constructor; there is
+    // nothing to apply here.
+}
+
+int CChannelVirtual::getIpTTL() const
+{
+    // No IP socket to query in the virtual transport mode.
+    throw CUDTException(MJ_NOTSUP, MN_INVAL, 0);
+}
+
+int CChannelVirtual::getIpToS() const
+{
+    // No IP socket to query in the virtual transport mode.
+    throw CUDTException(MJ_NOTSUP, MN_INVAL, 0);
+}
+
+#ifdef SRT_ENABLE_BINDTODEVICE
+bool CChannelVirtual::getBind(char* dst SRT_ATR_UNUSED, size_t len SRT_ATR_UNUSED) const
+{
+    // No IP socket to query the bound device from.
+    return false;
+}
+#endif
+
+const sockaddr_any& CChannelVirtual::bindAddressAny()
+{
+    return m_Label;
+}
+
 } // namespace srt
