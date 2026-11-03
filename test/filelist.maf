@@ -35,3 +35,10 @@ test_snd_rate_estimator.cpp
 
 SOURCES - ENABLE_BONDING
 test_bonding.cpp
+
+# Tests for the virtual transport seam helper (srttransport) only - put
+# here! The test binary links the srttransport library when this feature
+# is enabled (see the ENABLE_UNITTESTS block in CMakeLists.txt).
+
+SOURCES - ENABLE_VIRTUAL_TRANSPORT
+test_transport_queue.cpp

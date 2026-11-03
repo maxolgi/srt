@@ -1327,6 +1327,33 @@ if (srt_libspec_static)
 	endif()
 endif()
 
+# ----------------------------------
+# Target: srttransport (static library)
+# ----------------------------------
+
+# The OPTIONAL owner-side helper for the virtual transport seam: the
+# push-queue "injection" model built on top of the callbacks of
+# SRT_VirtualTransportConfig, so that an application gets back the easy
+# push API. This is a separate facility, NOT a part of the SRT library:
+# it uses only the public srt.h types, calls no srt_* function, and needs
+# nothing from libsrt to be linked against it. Being outside of srtcore
+# it may freely use the modern C++ library (std::mutex etc.).
+
+if (ENABLE_VIRTUAL_TRANSPORT)
+	add_library(srttransport STATIC
+		srttransport/srttransport.h
+		srttransport/srttransport.cpp
+	)
+	srt_set_stdcxx(srttransport 11)
+	target_include_directories(srttransport PUBLIC
+		${PROJECT_SOURCE_DIR}/srttransport
+		${PROJECT_SOURCE_DIR}/srtcore
+	)
+	if (PTHREAD_LIBRARY)
+		target_link_libraries(srttransport PUBLIC ${PTHREAD_LIBRARY})
+	endif()
+endif()
+
 # This add things to the declarations of the dependent libraries when
 # generating pkg-config.
 if (MICROSOFT)
@@ -1752,6 +1779,13 @@ if (ENABLE_UNITTESTS)
 		${srt_libtarget_for_apps}
 		${PTHREAD_LIBRARY}
 	)
+
+	if (ENABLE_VIRTUAL_TRANSPORT)
+		# The srttransport helper tests are compiled in only with the
+		# feature (see test/filelist.maf); the binary then needs the
+		# helper library linked in as well.
+		target_link_libraries(test-srt srttransport)
+	endif()
 
 	set_tests_properties(${tests_srt} PROPERTIES RUN_SERIAL TRUE)
 	if (ENABLE_UNITTESTS_DISCOVERY)
