@@ -5151,7 +5151,23 @@ EConnectStatus CUDT::postConnect(const CPacket* pResponse, bool rendezvous, CUDT
     CInfoBlock ib;
     ib.m_iIPversion = m_PeerAddr.family();
     CInfoBlock::convert(m_PeerAddr, ib.m_piIP);
-    if (m_pCache->lookup(&ib) >= 0)
+    // The cache is keyed by the peer address, but over a virtual transport
+    // that address is a synthetic label that repeats across sessions, so a
+    // hit would restore the values of an unrelated session over the
+    // configured seed. Seed from the virtual transport configuration instead
+    // (variance = mean/4, the RFC 6298 RTO shape of 2*SRTT; an unset value
+    // keeps the open()-time defaults). A live RTT sample still overrides the
+    // seed through the normal ACK processing path.
+    const SRT_VirtualTransportConfig* vt = m_pMuxer ? m_pMuxer->channel()->vtconfig() : NULL;
+    if (vt)
+    {
+        if (vt->initial_rtt_ms > 0)
+        {
+            m_iSRTT   = vt->initial_rtt_ms * 1000;
+            m_iRTTVar = m_iSRTT / 4;
+        }
+    }
+    else if (m_pCache->lookup(&ib) >= 0)
     {
         m_iSRTT      = ib.m_iSRTT;
         m_iRTTVar    = ib.m_iSRTT / 2;
@@ -6118,7 +6134,20 @@ void CUDT::acceptAndRespond(CUDTSocket* lsn, const sockaddr_any& peer, const CPa
     CInfoBlock ib;
     ib.m_iIPversion = peer.family();
     CInfoBlock::convert(peer, ib.m_piIP);
-    if (m_pCache->lookup(&ib) >= 0)
+    // As in postConnect: over a virtual transport (the accepted socket has
+    // joined the listener's multiplexer, so the channel's vtconfig() reaches
+    // it here) skip the per-address cache and seed the RTT from the
+    // configuration instead.
+    const SRT_VirtualTransportConfig* vt = m_pMuxer ? m_pMuxer->channel()->vtconfig() : NULL;
+    if (vt)
+    {
+        if (vt->initial_rtt_ms > 0)
+        {
+            m_iSRTT   = vt->initial_rtt_ms * 1000;
+            m_iRTTVar = m_iSRTT / 4;
+        }
+    }
+    else if (m_pCache->lookup(&ib) >= 0)
     {
         m_iSRTT      = ib.m_iSRTT;
         m_iRTTVar    = ib.m_iSRTT / 2;
@@ -6714,13 +6743,20 @@ bool srt::CUDT::closeEntity(int reason) ATR_NOEXCEPT
     case CUDT::SSS_SHUTDOWN: // OR
     case CUDT::SSS_BROKEN:
         {
-            // Store current connection information.
-            CInfoBlock ib;
-            ib.m_iIPversion = m_PeerAddr.family();
-            CInfoBlock::convert(m_PeerAddr, ib.m_piIP);
-            ib.m_iSRTT      = m_iSRTT;
-            ib.m_iBandwidth = m_iBandwidth;
-            m_pCache->update(&ib);
+            // Store current connection information - except over a virtual
+            // transport, whose synthetic peer labels repeat across sessions
+            // and would pollute the cache shared with UDP sockets (see
+            // postConnect for the read side).
+            const SRT_VirtualTransportConfig* vt = m_pMuxer ? m_pMuxer->channel()->vtconfig() : NULL;
+            if (!vt)
+            {
+                CInfoBlock ib;
+                ib.m_iIPversion = m_PeerAddr.family();
+                CInfoBlock::convert(m_PeerAddr, ib.m_piIP);
+                ib.m_iSRTT      = m_iSRTT;
+                ib.m_iBandwidth = m_iBandwidth;
+                m_pCache->update(&ib);
+            }
 
 #if SRT_DEBUG_RTT
             s_rtt_trace.trace(steady_clock::now(), "Cache", -1, -1,
