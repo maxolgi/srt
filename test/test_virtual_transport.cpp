@@ -14,14 +14,18 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
+#include <future>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include <arpa/inet.h>
+#include <dirent.h>
 #include <sys/socket.h>
+#include <unistd.h>
 
 #include "srt.h"
 #include "srttransport.h"
@@ -109,6 +113,51 @@ void FillWireSource(Wire& w, const sockaddr_in& sa)
     w.source_len = sizeof sa;
 }
 
+// The same source-address fill for the switch below, which reports the
+// shared listener address as the source of everything it forwards.
+void FillSource(sockaddr_storage& addr, socklen_t& addr_len, const sockaddr_in& sa)
+{
+    memset(&addr, 0, sizeof addr);
+    memcpy(&addr, &sa, sizeof sa);
+    addr_len = sizeof sa;
+}
+
+// Routes the datagrams sent by ONE shared transport queue to one of several
+// peer queues, by destination address - a miniature of a gateway
+// demultiplexing WebTransport sessions onto SRT sockets. Used where several
+// callers are served by one listener: every accepted socket sends through
+// the listener's queue, and the destination address (the caller's source
+// label) picks the caller whose queue must receive it.
+struct Switch
+{
+    struct Route
+    {
+        sockaddr_in                  dst;
+        srt::SRTTransportQueue* peer;
+    };
+    std::vector<Route> routes;
+    sockaddr_storage         source_addr;
+    socklen_t                source_len = 0;
+};
+
+int SwitchSend(void* opaq, const char* data, int len, const struct sockaddr* dst, int /*dstlen*/)
+{
+    Switch*            sw = (Switch*)opaq;
+    const sockaddr_in* d  = (const sockaddr_in*)dst;
+    for (Switch::Route& r : sw->routes)
+    {
+        if (d->sin_family == AF_INET && d->sin_port == r.dst.sin_port && d->sin_addr.s_addr == r.dst.sin_addr.s_addr)
+        {
+            if (r.peer->push(data, (size_t)len, (const struct sockaddr*)&sw->source_addr, sw->source_len) == -1)
+                return -1;
+            break;
+        }
+    }
+
+    // An unroutable datagram is swallowed, as a datagram lost on a wire.
+    return len;
+}
+
 // Pins the handshake request type of the very first datagram sent through
 // the wire - the opening flight of the socket behind it. On the wire the
 // datagram is the fixed 16-byte SRT packet header (CPacket::HDR_SIZE)
@@ -171,6 +220,49 @@ bool WaitReadable(SRTSOCKET sock, int timeout_ms)
 void ExpectLastErrno(int expected)
 {
     EXPECT_EQ(srt_getlasterror(NULL), expected) << srt_getlasterror_str();
+}
+
+// Bounded wait for a socket state, so that a connection that never
+// completes fails the test instead of hanging a subsequent call.
+bool WaitState(SRTSOCKET sock, SRT_SOCKSTATUS state, int timeout_ms)
+{
+    for (int waited = 0; waited < timeout_ms; waited += 10)
+    {
+        if (srt_getsockstate(sock) == state)
+            return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    return srt_getsockstate(sock) == state;
+}
+
+// Counts the open file descriptors of the current process that are sockets
+// (Linux-only; the feature itself is Linux/Emscripten-only). A virtual
+// binding creates no OS socket, so the count must not move across a whole
+// virtual-socket lifecycle. (An SRT epoll id is an anon_inode, not a
+// socket, so epoll-based waits do not disturb this count.)
+static int CountSocketFds()
+{
+    DIR* dir = opendir("/proc/self/fd");
+    if (!dir)
+        return -1;
+
+    int            count = 0;
+    struct dirent* entry;
+    char           link[64];
+    while ((entry = readdir(dir)))
+    {
+        if (entry->d_name[0] == '.')
+            continue;
+        const std::string path  = std::string("/proc/self/fd/") + entry->d_name;
+        const ssize_t     nread = readlink(path.c_str(), link, sizeof link - 1);
+        if (nread <= 0)
+            continue;
+        link[nread] = 0;
+        if (strncmp(link, "socket:", 7) == 0)
+            ++count;
+    }
+    closedir(dir);
+    return count;
 }
 
 // The label contract of srt_bind_virtual: srt_getsockname() must report
@@ -1106,6 +1198,628 @@ TEST_F(TestVirtualTransport, DuplicateSourceLabelRejected)
     ASSERT_EQ(srt_recvmsg(m_accepted_sock, buf, (int)sizeof buf), payload_len) << srt_getlasterror_str();
 
     // Clean close - the first connection and the listener.
+    EXPECT_EQ(srt_close(m_accepted_sock), SRT_STATUS_OK) << srt_getlasterror_str();
+    m_accepted_sock = SRT_INVALID_SOCK;
+    EXPECT_EQ(srt_close(m_caller_sock), SRT_STATUS_OK) << srt_getlasterror_str();
+    m_caller_sock = SRT_INVALID_SOCK;
+    EXPECT_EQ(srt_close(m_listener_sock), SRT_STATUS_OK) << srt_getlasterror_str();
+    m_listener_sock = SRT_INVALID_SOCK;
+}
+
+// The dedicated-muxer async teardown race: a paced sender and a verifying
+// receiver run as real concurrent threads, and srt_close() of the caller
+// strikes in the middle of the live stream, on its own thread. The close
+// path must tear down the caller's dedicated multiplexer - stopping its
+// sender and receiver workers and joining them - while the sending
+// application thread is still inside srt_sendmsg on the same socket, so
+// every join here is bounded and any deadlock fails the test instead of
+// hanging it. Once srt_close() has returned, SRT must never invoke the
+// transport callbacks of that socket again: the wire and the queue are
+// application objects now (see SRTTransportQueue), so the owner must be
+// free to release them - the send callback count must be frozen, which
+// pins that SRT truly stops the workers rather than leaving them to fire
+// into freed memory. The peer must observe the end of the stream through
+// its bounded receive, never by waiting forever, and the accepted socket
+// and the listener must close cleanly afterwards (the check-close mode of
+// the test binary must stay happy about them).
+TEST_F(TestVirtualTransport, CloseDuringLiveTraffic)
+{
+    const sockaddr_in listener_addr = FillV4("10.220.0.2", 5555);
+    const sockaddr_in caller_addr   = FillV4("10.220.0.1", 5556);
+
+    PairWires(caller_addr, listener_addr);
+
+    // Listener side: skip_induction both ways, as a WebTransport gateway
+    // would configure its sessions.
+    m_listener_sock = srt_create_socket();
+    ASSERT_NE(m_listener_sock, SRT_INVALID_SOCK);
+    m_listener_wire.sock = m_listener_sock;
+    {
+        const SRT_VirtualTransportConfig cfg = m_listener_queue.getConfig(0, 1);
+        ASSERT_EQ(srt_bind_virtual(m_listener_sock, (const sockaddr*)&listener_addr, (int)sizeof listener_addr, &cfg),
+                  SRT_STATUS_OK)
+            << srt_getlasterror_str();
+    }
+    ASSERT_NE(srt_listen(m_listener_sock, 4), SRT_ERROR) << srt_getlasterror_str();
+
+    m_caller_sock = srt_create_socket();
+    ASSERT_NE(m_caller_sock, SRT_INVALID_SOCK);
+    m_caller_wire.sock = m_caller_sock;
+    {
+        const SRT_VirtualTransportConfig cfg = m_caller_queue.getConfig(0, 1);
+        ASSERT_EQ(srt_bind_virtual(m_caller_sock, (const sockaddr*)&caller_addr, (int)sizeof caller_addr, &cfg),
+                  SRT_STATUS_OK)
+            << srt_getlasterror_str();
+    }
+
+    ASSERT_NE(srt_connect(m_caller_sock, (const sockaddr*)&listener_addr, (int)sizeof listener_addr), SRT_ERROR)
+        << srt_getlasterror_str();
+
+    ASSERT_TRUE(WaitReadable(m_listener_sock, 15000)) << "no connection was ever queued on the listener";
+
+    sockaddr_in accept_addr;
+    int         accept_len = (int)sizeof accept_addr;
+    m_accepted_sock        = srt_accept(m_listener_sock, (sockaddr*)&accept_addr, &accept_len);
+    ASSERT_NE(m_accepted_sock, SRT_INVALID_SOCK) << srt_getlasterror_str();
+
+    // Fail fast instead of hanging should the stream end go unobserved.
+    // The window still sits well above the default 120 ms TSBPD latency,
+    // so the healthy stream is never cut by it.
+    const int rcv_timeout_ms = 500;
+    ASSERT_NE(srt_setsockopt(m_accepted_sock, 0, SRTO_RCVTIMEO, &rcv_timeout_ms, sizeof rcv_timeout_ms), SRT_ERROR)
+        << srt_getlasterror_str();
+
+    // A sanity round trip first, so the stream provably flows before the
+    // close.
+    const char* warm_up     = "vt-close warm-up";
+    const int   warm_up_len = (int)strlen(warm_up);
+    char        buf[1456];
+    ASSERT_EQ(srt_sendmsg(m_caller_sock, warm_up, warm_up_len, SRT_MSGTTL_INF, false), warm_up_len)
+        << srt_getlasterror_str();
+    ASSERT_EQ(srt_recvmsg(m_accepted_sock, buf, (int)sizeof buf), warm_up_len) << srt_getlasterror_str();
+
+    // The mid-stream signal: the receiver announces through the promise
+    // once a fair chunk of the stream has been delivered, and the main
+    // thread waits for that with a deadline before closing. The promise
+    // is shared so that a failure path cannot leave it dangling.
+    std::shared_ptr<std::promise<void> > stream_flowing(new std::promise<void>);
+    auto                                 stream_flowing_f = stream_flowing->get_future();
+
+    struct RecvStats
+    {
+        int  received   = 0;
+        bool ended      = false;
+        bool sequence_ok = true;
+        int  last_error = 0;
+    };
+
+    const int stream_msgs = 2000;
+
+    // The sender paces the stream so that it is guaranteed to still be
+    // flowing when the close strikes; the pacing shapes the traffic, it
+    // is not a wait for a condition.
+    auto sender = std::async(std::launch::async,
+                             [this, stream_msgs]()
+                             {
+                                 int sent_ok = 0;
+                                 for (int i = 0; i < stream_msgs; ++i)
+                                 {
+                                     char      msg[64];
+                                     const int len = snprintf(msg, sizeof msg, "vt-close stream %05d", i);
+                                     if (srt_sendmsg(m_caller_sock, msg, len, SRT_MSGTTL_INF, false) == SRT_ERROR)
+                                         break; // a clean refusal is acceptable; a hang or a crash is not
+                                     ++sent_ok;
+                                     std::this_thread::sleep_for(std::chrono::microseconds(500));
+                                 }
+                                 return sent_ok;
+                             });
+
+    auto receiver = std::async(std::launch::async,
+                               [this, stream_flowing]()
+                               {
+                                   RecvStats st;
+                                   char      buf2[1456];
+                                   for (;;)
+                                   {
+                                       const int len = srt_recvmsg(m_accepted_sock, buf2, (int)sizeof buf2);
+                                       if (len == SRT_ERROR)
+                                       {
+                                           // The bounded stream-end signal: the receive timeout,
+                                           // or the connection broken by the peer's shutdown.
+                                           st.last_error = srt_getlasterror(NULL);
+                                           if (st.received >= 50)
+                                               st.ended = true;
+                                           break;
+                                       }
+
+                                       char      want[64];
+                                       const int wlen = snprintf(want, sizeof want, "vt-close stream %05d", st.received);
+                                       if (len != wlen || memcmp(buf2, want, len) != 0)
+                                       {
+                                           st.sequence_ok = false;
+                                           break;
+                                       }
+                                       ++st.received;
+                                       if (st.received == 50)
+                                           stream_flowing->set_value();
+                                   }
+                                   return st;
+                               });
+
+    // Wait until the stream is provably flowing, bounded.
+    ASSERT_EQ(stream_flowing_f.wait_for(std::chrono::seconds(10)), std::future_status::ready)
+        << "the stream never flowed before the close";
+
+    // The close itself, on its own thread and bounded: it must return
+    // even while the sender is in mid-stream.
+    auto closer = std::async(std::launch::async, [this]() { return srt_close(m_caller_sock); });
+    ASSERT_EQ(closer.wait_for(std::chrono::seconds(10)), std::future_status::ready)
+        << "srt_close deadlocked against the live traffic";
+    EXPECT_EQ(closer.get(), SRT_STATUS_OK) << srt_getlasterror_str();
+    // The caller socket is closed exactly once - by the closer thread.
+    m_caller_sock = SRT_INVALID_SOCK;
+
+    // Both traffic threads must finish well within their bounds - the
+    // sender runs until its sends start failing on the closed socket, the
+    // receiver until the stream end is reported.
+    ASSERT_EQ(sender.wait_for(std::chrono::seconds(15)), std::future_status::ready)
+        << "the sender thread hung after the close";
+    const int sent_ok = sender.get();
+    ASSERT_EQ(receiver.wait_for(std::chrono::seconds(15)), std::future_status::ready)
+        << "the receiver thread hung after the close";
+    const RecvStats rs = receiver.get();
+
+    EXPECT_GE(sent_ok, 1);
+    EXPECT_TRUE(rs.sequence_ok) << "the received stream broke its sequence";
+    EXPECT_GE(rs.received, 50);
+    EXPECT_TRUE(rs.ended) << "the peer never observed the end of the stream";
+    EXPECT_TRUE(rs.last_error == SRT_ETIMEOUT || rs.last_error == SRT_ECONNLOST)
+        << "the stream end was reported as an unexpected error " << rs.last_error;
+
+    // After the close has returned (and the application has stopped
+    // sending), SRT must never invoke the send callback again: the wire is
+    // an application object, and this freeze is what frees the owner to
+    // release it. A short grace period lets any callback already in
+    // flight when srt_close returned complete, so the freeze window
+    // measures the steady state, not the tail of the race.
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    const long long callbacks_frozen = m_caller_wire.send_count.load();
+    bool           frozen           = true;
+    for (int waited = 0; waited < 1000 && frozen; waited += 10)
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        if (m_caller_wire.send_count.load() != callbacks_frozen)
+            frozen = false;
+    }
+    EXPECT_TRUE(frozen) << "the send callback fired again after srt_close returned";
+
+    // The teardown of the peer side must stay clean and bounded: the
+    // accepted socket observed the stream end, and the listener leaves
+    // with its accepted socket gone.
+    const std::chrono::steady_clock::time_point teardown_start = std::chrono::steady_clock::now();
+    EXPECT_EQ(srt_close(m_accepted_sock), SRT_STATUS_OK) << srt_getlasterror_str();
+    m_accepted_sock = SRT_INVALID_SOCK;
+    EXPECT_EQ(srt_close(m_listener_sock), SRT_STATUS_OK) << srt_getlasterror_str();
+    m_listener_sock = SRT_INVALID_SOCK;
+    const long long teardown_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                      std::chrono::steady_clock::now() - teardown_start)
+                                      .count();
+    EXPECT_LT(teardown_ms, 10000) << "closing the peer side after the mid-stream close stalled";
+}
+
+// Several callers, ONE listener: every accepted socket shares the
+// listener's virtual multiplexer, so all three sessions exchange their
+// datagrams through the same listener queue, with the switch
+// demultiplexing by the destination address (the caller's source label) -
+// the shape of a gateway serving several WebTransport sessions over one SRT
+// listener. The callers connect sequentially, and every accepted socket
+// must independently carry payload, both ways, with all three connections
+// open at once and no cross-talk between them.
+TEST_F(TestVirtualTransport, MultiAcceptSharedListenerMultiplexer)
+{
+    const sockaddr_in listener_addr = FillV4("10.221.0.2", 5555);
+
+    // Everything lives in this struct because the queues and wires must
+    // outlive the sockets: the destructor closes the sockets first - which
+    // sends their shutdown through the wires - and destroys the queues
+    // and wires only afterwards.
+    struct Session
+    {
+        SRTSOCKET caller   = SRT_INVALID_SOCK;
+        SRTSOCKET accepted = SRT_INVALID_SOCK;
+        Wire      caller_wire;
+        sockaddr_in caller_addr;
+        // The wire must be declared before the queue that hands it to the
+        // send callback: members are destroyed in reverse order, so the
+        // queue goes away first.
+        srt::SRTTransportQueue caller_queue{ &WireSend, &caller_wire };
+    };
+
+    struct Rig
+    {
+        SRTSOCKET listener = SRT_INVALID_SOCK;
+        Switch    listener_switch;
+        srt::SRTTransportQueue listener_queue{ &SwitchSend, &listener_switch };
+        Session              sessions[3];
+
+        ~Rig()
+        {
+            for (Session& s : sessions)
+            {
+                if (s.accepted != SRT_INVALID_SOCK)
+                    srt_close(s.accepted);
+                if (s.caller != SRT_INVALID_SOCK)
+                    srt_close(s.caller);
+            }
+            if (listener != SRT_INVALID_SOCK)
+                srt_close(listener);
+        }
+    } rig;
+
+    rig.listener = srt_create_socket();
+    ASSERT_NE(rig.listener, SRT_INVALID_SOCK);
+    {
+        const SRT_VirtualTransportConfig cfg = rig.listener_queue.getConfig(0, 1);
+        ASSERT_EQ(srt_bind_virtual(rig.listener, (const sockaddr*)&listener_addr, (int)sizeof listener_addr, &cfg),
+                  SRT_STATUS_OK)
+            << srt_getlasterror_str();
+    }
+    // Everything the shared queue sends out reports the listener's label as
+    // its source; the switch routes it to the caller the datagram is
+    // addressed to.
+    FillSource(rig.listener_switch.source_addr, rig.listener_switch.source_len, listener_addr);
+    ASSERT_NE(srt_listen(rig.listener, 4), SRT_ERROR) << srt_getlasterror_str();
+
+    // Three callers, sequentially - deterministically - each with its own
+    // queue wired into the shared listener queue.
+    const int num_sessions = (int)(sizeof rig.sessions / sizeof rig.sessions[0]);
+    for (int i = 0; i < num_sessions; ++i)
+    {
+        Session& s    = rig.sessions[i];
+        s.caller_addr = FillV4("10.221.1.1", (uint16_t)(5556 + i));
+
+        s.caller = srt_create_socket();
+        ASSERT_NE(s.caller, SRT_INVALID_SOCK);
+        s.caller_wire.sock = s.caller;
+        {
+            const SRT_VirtualTransportConfig cfg = s.caller_queue.getConfig(0, 1);
+            ASSERT_EQ(srt_bind_virtual(s.caller, (const sockaddr*)&s.caller_addr, (int)sizeof s.caller_addr, &cfg),
+                      SRT_STATUS_OK)
+                << srt_getlasterror_str();
+        }
+        s.caller_wire.peer = &rig.listener_queue;
+        FillWireSource(s.caller_wire, s.caller_addr);
+        rig.listener_switch.routes.push_back(Switch::Route{ s.caller_addr, &s.caller_queue });
+
+        ASSERT_NE(srt_connect(s.caller, (const sockaddr*)&listener_addr, (int)sizeof listener_addr), SRT_ERROR)
+            << srt_getlasterror_str();
+
+        ASSERT_TRUE(WaitReadable(rig.listener, 15000)) << "no connection was ever queued on the listener";
+
+        sockaddr_in accept_addr;
+        int         accept_len = (int)sizeof accept_addr;
+        s.accepted             = srt_accept(rig.listener, (sockaddr*)&accept_addr, &accept_len);
+        ASSERT_NE(s.accepted, SRT_INVALID_SOCK) << srt_getlasterror_str();
+
+        EXPECT_EQ(accept_addr.sin_addr.s_addr, s.caller_addr.sin_addr.s_addr);
+        EXPECT_EQ(accept_addr.sin_port, s.caller_addr.sin_port);
+        EXPECT_EQ(srt_getsockstate(s.caller), SRTS_CONNECTED);
+        EXPECT_EQ(srt_getsockstate(s.accepted), SRTS_CONNECTED);
+
+        // Fail fast instead of hanging should the shared-multiplexer
+        // routing ever cross the sessions.
+        const int rcv_timeout_ms = 5000;
+        ASSERT_NE(srt_setsockopt(s.accepted, 0, SRTO_RCVTIMEO, &rcv_timeout_ms, sizeof rcv_timeout_ms), SRT_ERROR)
+            << srt_getlasterror_str();
+        ASSERT_NE(srt_setsockopt(s.caller, 0, SRTO_RCVTIMEO, &rcv_timeout_ms, sizeof rcv_timeout_ms), SRT_ERROR)
+            << srt_getlasterror_str();
+    }
+
+    // Interleaved traffic with all three connections open: every caller
+    // sends, every accepted socket receives its own - and only its own -
+    // message; then the reverse direction.
+    char payloads[3][64];
+    char buf[1456];
+    for (int i = 0; i < num_sessions; ++i)
+    {
+        snprintf(payloads[i], sizeof payloads[i], "multi-accept session %d", i);
+        const int len = (int)strlen(payloads[i]);
+        ASSERT_EQ(srt_sendmsg(rig.sessions[i].caller, payloads[i], len, SRT_MSGTTL_INF, false), len)
+            << srt_getlasterror_str();
+    }
+    for (int i = 0; i < num_sessions; ++i)
+    {
+        const int len = (int)strlen(payloads[i]);
+        ASSERT_EQ(srt_recvmsg(rig.sessions[i].accepted, buf, (int)sizeof buf), len) << srt_getlasterror_str();
+        EXPECT_EQ(memcmp(buf, payloads[i], len), 0) << "session " << i << " received a foreign message";
+    }
+    for (int i = 0; i < num_sessions; ++i)
+    {
+        const int len = (int)strlen(payloads[i]);
+        ASSERT_EQ(srt_sendmsg(rig.sessions[i].accepted, payloads[i], len, SRT_MSGTTL_INF, false), len)
+            << srt_getlasterror_str();
+    }
+    for (int i = 0; i < num_sessions; ++i)
+    {
+        const int len = (int)strlen(payloads[i]);
+        ASSERT_EQ(srt_recvmsg(rig.sessions[i].caller, buf, (int)sizeof buf), len) << srt_getlasterror_str();
+        EXPECT_EQ(memcmp(buf, payloads[i], len), 0) << "session " << i << " received a foreign message";
+    }
+
+    // Clean close - the accepted sockets, the callers, then the listener.
+    for (Session& s : rig.sessions)
+    {
+        EXPECT_EQ(srt_close(s.accepted), SRT_STATUS_OK) << srt_getlasterror_str();
+        s.accepted = SRT_INVALID_SOCK;
+    }
+    for (Session& s : rig.sessions)
+    {
+        EXPECT_EQ(srt_close(s.caller), SRT_STATUS_OK) << srt_getlasterror_str();
+        s.caller = SRT_INVALID_SOCK;
+    }
+    EXPECT_EQ(srt_close(rig.listener), SRT_STATUS_OK) << srt_getlasterror_str();
+    rig.listener = SRT_INVALID_SOCK;
+}
+
+// Two callers bound virtually to the IDENTICAL name/label: every
+// srt_bind_virtual() call creates a dedicated multiplexer that is never
+// reused by another socket, so the two callers coexist despite reporting
+// the same source label - their connections are told apart by which
+// listener they went to, not by the label alone. Both sessions are open at
+// the same time and carry independent traffic. The whole lifecycle must
+// also create not a single OS socket: a virtual binding owns no OS
+// resource, pinned by counting the socket fds in /proc/self/fd before,
+// during and after the sessions (the feature is Linux-only, and so is the
+// check).
+TEST_F(TestVirtualTransport, DedicatedMuxerSameLabel)
+{
+    // The identical label both callers report to their listeners.
+    const sockaddr_in shared_label = FillV4("10.222.0.1", 5556);
+
+    const int sockets_before = CountSocketFds();
+    ASSERT_GE(sockets_before, 0);
+
+    // Everything lives in this struct because the queues and wires must
+    // outlive the sockets (see MultiAcceptSharedListenerMultiplexer).
+    struct Pair
+    {
+        SRTSOCKET listener  = SRT_INVALID_SOCK;
+        SRTSOCKET caller    = SRT_INVALID_SOCK;
+        SRTSOCKET accepted  = SRT_INVALID_SOCK;
+        sockaddr_in listener_addr;
+        Wire        caller_wire;   // the caller's outgoing datagrams, sourced by the shared label
+        Wire        listener_wire; // the listener's outgoing datagrams, sourced by its own label
+        srt::SRTTransportQueue caller_queue{ &WireSend, &caller_wire };
+        srt::SRTTransportQueue listener_queue{ &WireSend, &listener_wire };
+
+        ~Pair()
+        {
+            if (accepted != SRT_INVALID_SOCK)
+                srt_close(accepted);
+            if (caller != SRT_INVALID_SOCK)
+                srt_close(caller);
+            if (listener != SRT_INVALID_SOCK)
+                srt_close(listener);
+        }
+    };
+
+    struct Rig
+    {
+        Pair pairs[2];
+    } rig;
+    rig.pairs[0].listener_addr = FillV4("10.222.0.2", 5555);
+    rig.pairs[1].listener_addr = FillV4("10.222.0.3", 5555);
+
+    // Two listeners, each on its own label and its own queue.
+    for (Pair& p : rig.pairs)
+    {
+        p.listener = srt_create_socket();
+        ASSERT_NE(p.listener, SRT_INVALID_SOCK);
+        p.listener_wire.sock = p.listener;
+        {
+            const SRT_VirtualTransportConfig cfg = p.listener_queue.getConfig(0, 1);
+            ASSERT_EQ(srt_bind_virtual(p.listener, (const sockaddr*)&p.listener_addr, (int)sizeof p.listener_addr, &cfg),
+                      SRT_STATUS_OK)
+                << srt_getlasterror_str();
+        }
+        p.listener_wire.peer = &p.caller_queue;
+        FillWireSource(p.listener_wire, p.listener_addr);
+        ASSERT_NE(srt_listen(p.listener, 4), SRT_ERROR) << srt_getlasterror_str();
+    }
+
+    // Two callers, both bound virtually to the IDENTICAL label, each wired
+    // to its own listener.
+    for (Pair& p : rig.pairs)
+    {
+        p.caller = srt_create_socket();
+        ASSERT_NE(p.caller, SRT_INVALID_SOCK);
+        p.caller_wire.sock = p.caller;
+        {
+            const SRT_VirtualTransportConfig cfg = p.caller_queue.getConfig(0, 1);
+            ASSERT_EQ(srt_bind_virtual(p.caller, (const sockaddr*)&shared_label, (int)sizeof shared_label, &cfg),
+                      SRT_STATUS_OK)
+                << srt_getlasterror_str();
+        }
+        ExpectSockName(p.caller, shared_label);
+        p.caller_wire.peer = &p.listener_queue;
+        FillWireSource(p.caller_wire, shared_label);
+    }
+
+    // Both connections at the same time: both connects are placed before
+    // either accept is taken.
+    for (Pair& p : rig.pairs)
+    {
+        ASSERT_NE(srt_connect(p.caller, (const sockaddr*)&p.listener_addr, (int)sizeof p.listener_addr), SRT_ERROR)
+            << srt_getlasterror_str();
+    }
+    for (Pair& p : rig.pairs)
+    {
+        ASSERT_TRUE(WaitReadable(p.listener, 15000)) << "no connection was ever queued on the listener";
+
+        sockaddr_in accept_addr;
+        int         accept_len = (int)sizeof accept_addr;
+        p.accepted             = srt_accept(p.listener, (sockaddr*)&accept_addr, &accept_len);
+        ASSERT_NE(p.accepted, SRT_INVALID_SOCK) << srt_getlasterror_str();
+        // Both listeners see the very same peer label - harmless, because
+        // neither multiplexer serves any other peer.
+        EXPECT_EQ(accept_addr.sin_addr.s_addr, shared_label.sin_addr.s_addr);
+        EXPECT_EQ(accept_addr.sin_port, shared_label.sin_port);
+    }
+
+    const int rcv_timeout_ms = 5000;
+    for (Pair& p : rig.pairs)
+    {
+        ASSERT_TRUE(WaitState(p.caller, SRTS_CONNECTED, 5000)) << "the caller never completed the connection";
+        EXPECT_EQ(srt_getsockstate(p.accepted), SRTS_CONNECTED);
+        ASSERT_NE(srt_setsockopt(p.caller, 0, SRTO_RCVTIMEO, &rcv_timeout_ms, sizeof rcv_timeout_ms), SRT_ERROR)
+            << srt_getlasterror_str();
+        ASSERT_NE(srt_setsockopt(p.accepted, 0, SRTO_RCVTIMEO, &rcv_timeout_ms, sizeof rcv_timeout_ms), SRT_ERROR)
+            << srt_getlasterror_str();
+    }
+
+    // The identical label must not cross the two sessions: each pair
+    // exchanges its own payload, both ways, with both open at once.
+    const char* payloads[2] = { "same-label session zero", "same-label session one" };
+    char        buf[1456];
+    for (int i = 0; i < 2; ++i)
+    {
+        const int len = (int)strlen(payloads[i]);
+        ASSERT_EQ(srt_sendmsg(rig.pairs[i].caller, payloads[i], len, SRT_MSGTTL_INF, false), len)
+            << srt_getlasterror_str();
+    }
+    for (int i = 0; i < 2; ++i)
+    {
+        const int len = (int)strlen(payloads[i]);
+        ASSERT_EQ(srt_recvmsg(rig.pairs[i].accepted, buf, (int)sizeof buf), len) << srt_getlasterror_str();
+        EXPECT_EQ(memcmp(buf, payloads[i], len), 0) << "session " << i << " received a foreign message";
+    }
+    for (int i = 0; i < 2; ++i)
+    {
+        const int len = (int)strlen(payloads[i]);
+        ASSERT_EQ(srt_sendmsg(rig.pairs[i].accepted, payloads[i], len, SRT_MSGTTL_INF, false), len)
+            << srt_getlasterror_str();
+    }
+    for (int i = 0; i < 2; ++i)
+    {
+        const int len = (int)strlen(payloads[i]);
+        ASSERT_EQ(srt_recvmsg(rig.pairs[i].caller, buf, (int)sizeof buf), len) << srt_getlasterror_str();
+        EXPECT_EQ(memcmp(buf, payloads[i], len), 0) << "session " << i << " received a foreign message";
+    }
+
+    // The whole two-session lifecycle ran without creating a single OS
+    // socket - this is the peak, with four sockets connected.
+    EXPECT_EQ(CountSocketFds(), sockets_before) << "a virtual binding created an OS socket";
+
+    // Clean close - the accepted sockets, the callers, then the listeners.
+    for (Pair& p : rig.pairs)
+    {
+        EXPECT_EQ(srt_close(p.accepted), SRT_STATUS_OK) << srt_getlasterror_str();
+        p.accepted = SRT_INVALID_SOCK;
+    }
+    for (Pair& p : rig.pairs)
+    {
+        EXPECT_EQ(srt_close(p.caller), SRT_STATUS_OK) << srt_getlasterror_str();
+        p.caller = SRT_INVALID_SOCK;
+    }
+    for (Pair& p : rig.pairs)
+    {
+        EXPECT_EQ(srt_close(p.listener), SRT_STATUS_OK) << srt_getlasterror_str();
+        p.listener = SRT_INVALID_SOCK;
+    }
+
+    // And nothing OS-level leaked, either.
+    EXPECT_LE(CountSocketFds(), sockets_before);
+}
+
+// The receiver-side contract of SRTO_TLPKTDROP: a data packet lost on the
+// wire while later packets keep flowing must be dropped as too-late-to-play
+// once the first subsequent packet passes its TSBPD play time, instead of
+// holding the stream back waiting for a retransmission. The wire swallows
+// every copy (original and retransmissions) of one message; the stream must
+// complete with exactly the other messages delivered in order, and the
+// receiver must count the dropped packet in the stats. This is the receive
+// side that makes the sender's too-late retransmit skip correct: rexmitting
+// a packet the receiver would drop anyway wastes bandwidth.
+TEST_F(TestVirtualTransport, ReceiverDropsTooLateMissingPacket)
+{
+    const sockaddr_in listener_addr = FillV4("10.223.0.2", 5555);
+    const sockaddr_in caller_addr   = FillV4("10.223.0.1", 5556);
+
+    PairWires(caller_addr, listener_addr);
+
+    const int latency_ms = 60;
+
+    m_listener_sock = srt_create_socket();
+    ASSERT_NE(m_listener_sock, SRT_INVALID_SOCK);
+    ASSERT_NE(srt_setsockopt(m_listener_sock, 0, SRTO_LATENCY, &latency_ms, sizeof latency_ms), SRT_ERROR)
+        << srt_getlasterror_str();
+    m_listener_wire.sock = m_listener_sock;
+    {
+        const SRT_VirtualTransportConfig cfg = m_listener_queue.getConfig(0, 1);
+        ASSERT_EQ(srt_bind_virtual(m_listener_sock, (const sockaddr*)&listener_addr, (int)sizeof listener_addr, &cfg),
+                  SRT_STATUS_OK)
+            << srt_getlasterror_str();
+    }
+    ASSERT_NE(srt_listen(m_listener_sock, 4), SRT_ERROR) << srt_getlasterror_str();
+
+    m_caller_sock = srt_create_socket();
+    ASSERT_NE(m_caller_sock, SRT_INVALID_SOCK);
+    ASSERT_NE(srt_setsockopt(m_caller_sock, 0, SRTO_LATENCY, &latency_ms, sizeof latency_ms), SRT_ERROR)
+        << srt_getlasterror_str();
+    m_caller_wire.sock = m_caller_sock;
+    {
+        const SRT_VirtualTransportConfig cfg = m_caller_queue.getConfig(0, 1);
+        ASSERT_EQ(srt_bind_virtual(m_caller_sock, (const sockaddr*)&caller_addr, (int)sizeof caller_addr, &cfg),
+                  SRT_STATUS_OK)
+            << srt_getlasterror_str();
+    }
+
+    ASSERT_NE(srt_connect(m_caller_sock, (const sockaddr*)&listener_addr, (int)sizeof listener_addr), SRT_ERROR)
+        << srt_getlasterror_str();
+
+    ASSERT_TRUE(WaitReadable(m_listener_sock, 15000)) << "no connection was ever queued on the listener";
+
+    sockaddr_in accept_addr;
+    int         accept_len = (int)sizeof accept_addr;
+    m_accepted_sock        = srt_accept(m_listener_sock, (sockaddr*)&accept_addr, &accept_len);
+    ASSERT_NE(m_accepted_sock, SRT_INVALID_SOCK) << srt_getlasterror_str();
+
+    // Fail fast instead of hanging should the too-late drop not happen.
+    const int rcv_timeout_ms = 5000;
+    ASSERT_NE(srt_setsockopt(m_accepted_sock, 0, SRTO_RCVTIMEO, &rcv_timeout_ms, sizeof rcv_timeout_ms), SRT_ERROR)
+        << srt_getlasterror_str();
+
+    // From now on every datagram carrying the victim message disappears.
+    m_caller_wire.swallow_tag = "SWALLOW-ME";
+
+    const int num_msgs = 10;
+    char      payloads[num_msgs][64];
+    for (int i = 0; i < num_msgs; ++i)
+    {
+        snprintf(payloads[i], sizeof payloads[i], "vt-late msg %02d%s", i + 1, i == 0 ? " SWALLOW-ME" : "");
+        const int len = (int)strlen(payloads[i]);
+        ASSERT_EQ(srt_sendmsg(m_caller_sock, payloads[i], len, SRT_MSGTTL_INF, false), len) << srt_getlasterror_str();
+    }
+
+    // Messages 2..N must be delivered, in order. The delivery of message 2
+    // at all IS the too-late drop under test: TSBPD does not play a packet
+    // positioned after a sequence gap until the gap is either filled by a
+    // retransmission (swallowed here) or dropped as too late.
+    char buf[1456];
+    for (int i = 1; i < num_msgs; ++i)
+    {
+        const int recv_len = srt_recvmsg(m_accepted_sock, buf, (int)sizeof buf);
+        ASSERT_GT(recv_len, 0) << srt_getlasterror_str();
+        ASSERT_EQ(recv_len, (int)strlen(payloads[i]));
+        EXPECT_EQ(memcmp(buf, payloads[i], recv_len), 0) << "unexpected message at position " << i;
+    }
+
+    // The victim packet was counted as too-late-to-play on the receiver.
+    SRT_TRACEBSTATS perf;
+    ASSERT_EQ(srt_bstats(m_accepted_sock, &perf, 0), 0);
+    EXPECT_GE(perf.pktRcvDropTotal, 1);
+
+    // Clean close - the shutdown flights go through the wires too.
     EXPECT_EQ(srt_close(m_accepted_sock), SRT_STATUS_OK) << srt_getlasterror_str();
     m_accepted_sock = SRT_INVALID_SOCK;
     EXPECT_EQ(srt_close(m_caller_sock), SRT_STATUS_OK) << srt_getlasterror_str();
