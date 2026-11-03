@@ -60,10 +60,11 @@ modified by
 namespace srt
 {
 
+// Base class for the channel - the entity that handles the actual
+// transmission of packets. The interface used through a CChannel pointer
+// is declared here; see CChannelUDP for the UDP socket implementation.
 class CChannel
 {
-    void createSocket(int family);
-
 public:
     // XXX There's currently no way to access the socket ID set for
     // whatever the channel is currently working for. Required to find
@@ -71,8 +72,66 @@ public:
     // Currently just "unimplemented".
     std::string CONID() const { return ""; }
 
-    CChannel();
-    ~CChannel();
+    virtual ~CChannel();
+
+    /// Disconnect and close the UDP entity.
+    /// NOTE: All threads using the channel, except the one that
+    /// calls this function, must be closed PRIOR TO calling this function.
+    virtual void close() = 0;
+
+    /// Stops the internal UDP sockedt from being usable.
+    /// This can be called prior to closing the SND and RCV
+    /// queues in order to prevent them from hanging around in the
+    /// sending or receiving functions and delay joining the threads.
+    virtual void stop() = 0;
+
+    /// Query the socket address that the channel is using.
+    /// @param [out] addr pointer to store the returned socket address.
+
+    virtual sockaddr_any getSockAddr() const = 0;
+
+    /// Send a packet to the given address.
+    /// @param [in] addr pointer to the destination address.
+    /// @param [in] packet reference to a CPacket entity.
+    /// @param [in] src source address to sent on an outgoing packet (if not ANY)
+    /// @return Actual size of data sent.
+
+    virtual int sendto(const sockaddr_any& addr, CPacket& packet, const CNetworkInterface& src) const = 0;
+
+    /// Receive a packet from the channel and record the source address.
+    /// @param [in] addr pointer to the source address.
+    /// @param [in] packet reference to a CPacket entity.
+    /// @return Actual size of data received.
+
+    virtual EReadStatus recvfrom(sockaddr_any& addr, CPacket& packet) const = 0;
+
+    virtual void setConfig(const CSrtMuxerConfig& config) = 0;
+
+    /// Get the IP TTL.
+    /// @param [in] ttl IP Time To Live.
+    /// @return TTL.
+
+    virtual int getIpTTL() const = 0;
+
+    /// Get the IP Type of Service.
+    /// @return ToS.
+
+    virtual int getIpToS() const = 0;
+
+#ifdef SRT_ENABLE_BINDTODEVICE
+    virtual bool getBind(char* dst, size_t len) const = 0;
+#endif
+
+    virtual const sockaddr_any& bindAddressAny() = 0;
+};
+
+// UDP socket implementation of the CChannel interface.
+class CChannelUDP: public CChannel
+{
+    void createSocket(int family);
+
+public:
+    CChannelUDP();
 
     /// Open a UDP channel.
     /// @param [in] addr The local address that UDP will use.
@@ -86,15 +145,7 @@ public:
 
     void attach(SYSSOCKET udpsock, const sockaddr_any& adr);
 
-    /// Disconnect and close the UDP entity.
-    /// NOTE: All threads using the channel, except the one that
-    /// calls this function, must be closed PRIOR TO calling this function.
     void close();
-
-    /// Stops the internal UDP sockedt from being usable.
-    /// This can be called prior to closing the SND and RCV
-    /// queues in order to prevent them from hanging around in the
-    /// sending or receiving functions and delay joining the threads.
     void stop();
 
     /// Get the UDP sending buffer size.
@@ -107,9 +158,6 @@ public:
 
     int getRcvBufSize();
 
-    /// Query the socket address that the channel is using.
-    /// @param [out] addr pointer to store the returned socket address.
-
     sockaddr_any getSockAddr() const;
 
     /// Query the peer side socket address that the channel is connect to.
@@ -117,19 +165,7 @@ public:
 
     sockaddr_any getPeerAddr() const;
 
-    /// Send a packet to the given address.
-    /// @param [in] addr pointer to the destination address.
-    /// @param [in] packet reference to a CPacket entity.
-    /// @param [in] src source address to sent on an outgoing packet (if not ANY)
-    /// @return Actual size of data sent.
-
     int sendto(const sockaddr_any& addr, CPacket& packet, const CNetworkInterface& src) const;
-
-    /// Receive a packet from the channel and record the source address.
-    /// @param [in] addr pointer to the source address.
-    /// @param [in] packet reference to a CPacket entity.
-    /// @return Actual size of data received.
-
     EReadStatus recvfrom(sockaddr_any& addr, CPacket& packet) const;
 
     void setConfig(const CSrtMuxerConfig& config);
@@ -149,15 +185,7 @@ public:
         return retval;
     }
 
-    /// Get the IP TTL.
-    /// @param [in] ttl IP Time To Live.
-    /// @return TTL.
-
     int getIpTTL() const;
-
-    /// Get the IP Type of Service.
-    /// @return ToS.
-
     int getIpToS() const;
 
 #ifdef SRT_ENABLE_BINDTODEVICE

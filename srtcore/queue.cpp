@@ -1184,8 +1184,10 @@ void CMultiplexer::configure(int32_t id, const CSrtConfig& config, const sockadd
     m_mcfg = config;
     m_iID  = id;
 
-    // XXX Leaving as dynamic due to a potential for abstracting out the channel class.
-    m_pChannel = new CChannel();
+    // The channel class is abstracted out; keep the dynamic type
+    // as the CChannel base, with the UDP implementation underneath.
+    CChannelUDP* chan = new CChannelUDP();
+    m_pChannel = chan;
     m_pChannel->setConfig(m_mcfg);
 
     if (udpsock)
@@ -1193,21 +1195,21 @@ void CMultiplexer::configure(int32_t id, const CSrtConfig& config, const sockadd
         // In this case, reqaddr contains the address
         // that has been extracted already from the
         // given socket
-        m_pChannel->attach(*udpsock, reqaddr);
+        chan->attach(*udpsock, reqaddr);
     }
     else if (reqaddr.empty())
     {
         // If reqaddr was set as empty, only with set family,
         // just automatically bind to the "0" address to autoselect
         // everything.
-        m_pChannel->open(reqaddr.family());
+        chan->open(reqaddr.family());
     }
     else
     {
         // If at least the IP address is specified, then bind to that
         // address, but still possibly autoselect the outgoing port, if the
         // port was specified as 0.
-        m_pChannel->open(reqaddr);
+        chan->open(reqaddr);
     }
 
     // After the system binding the 0 port could be reassigned by the
@@ -1225,7 +1227,7 @@ void CMultiplexer::configure(int32_t id, const CSrtConfig& config, const sockadd
         // rejected as a potential conflict, even if binding would be accepted
         // in these circumstances. Only a perfect match in case of potential
         // overlapping will be accepted on the same port.
-        m_mcfg.iIpV6Only = m_pChannel->sockopt(IPPROTO_IPV6, IPV6_V6ONLY, -1);
+        m_mcfg.iIpV6Only = chan->sockopt(IPPROTO_IPV6, IPV6_V6ONLY, -1);
     }
 
     m_SndQueue.init(m_pChannel);
