@@ -17,6 +17,7 @@
 #include <cstring>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <arpa/inet.h>
@@ -556,6 +557,555 @@ TEST_F(TestVirtualTransport, BindVirtualDoubleBindRejected)
     EXPECT_EQ(srt_getsockstate(m_accepted_sock), SRTS_INIT);
 
     // All sockets remain closable - the rejections leaked no state.
+    EXPECT_EQ(srt_close(m_accepted_sock), SRT_STATUS_OK) << srt_getlasterror_str();
+    m_accepted_sock = SRT_INVALID_SOCK;
+    EXPECT_EQ(srt_close(m_caller_sock), SRT_STATUS_OK) << srt_getlasterror_str();
+    m_caller_sock = SRT_INVALID_SOCK;
+    EXPECT_EQ(srt_close(m_listener_sock), SRT_STATUS_OK) << srt_getlasterror_str();
+    m_listener_sock = SRT_INVALID_SOCK;
+}
+
+// The same wire as in BindVirtualConnectListenSendReceive, but with
+// skip_induction=1 in the configs of BOTH endpoints: the caller's opening
+// flight is the CONCLUSION handshake - HS_VERSION_SRT1, cookie 0, carrying
+// the HSv5 extension blocks - and the listener's multiplexer accepts it
+// without the Induction/cookie exchange. The wire-level pins make the
+// option's defining behavior falsifiable: a virtual listener would complete
+// a session against a stock caller too (it answers Inductions), so the
+// conclusion-first shape is only observable in the caller's very first
+// datagram. Proves the skip-induction path leaves the connected state and
+// the bidirectional data flow intact.
+TEST_F(TestVirtualTransport, BindVirtualSkipInductionRoundTrip)
+{
+    const sockaddr_in listener_addr = FillV4("10.215.0.2", 5555);
+    const sockaddr_in caller_addr   = FillV4("10.215.0.1", 5556);
+
+    PairWires(caller_addr, listener_addr);
+
+    // Listener side: the multiplexer config carries skip_induction, so its
+    // channel reports it and processConnectRequest bypasses the cookie
+    // check for a conclusion-first request.
+    m_listener_sock = srt_create_socket();
+    ASSERT_NE(m_listener_sock, SRT_INVALID_SOCK);
+    m_listener_wire.sock = m_listener_sock;
+    {
+        const SRT_VirtualTransportConfig cfg = m_listener_queue.getConfig(0, 1);
+        ASSERT_EQ(srt_bind_virtual(m_listener_sock, (const sockaddr*)&listener_addr, (int)sizeof listener_addr, &cfg),
+                  SRT_STATUS_OK)
+            << srt_getlasterror_str();
+    }
+    ASSERT_NE(srt_listen(m_listener_sock, 4), SRT_ERROR) << srt_getlasterror_str();
+
+    // Caller side: skip_induction in its multiplexer config turns the first
+    // handshake into the CONCLUSION.
+    m_caller_sock = srt_create_socket();
+    ASSERT_NE(m_caller_sock, SRT_INVALID_SOCK);
+    m_caller_wire.sock = m_caller_sock;
+    {
+        const SRT_VirtualTransportConfig cfg = m_caller_queue.getConfig(0, 1);
+        ASSERT_EQ(srt_bind_virtual(m_caller_sock, (const sockaddr*)&caller_addr, (int)sizeof caller_addr, &cfg),
+                  SRT_STATUS_OK)
+            << srt_getlasterror_str();
+    }
+
+    ASSERT_NE(srt_connect(m_caller_sock, (const sockaddr*)&listener_addr, (int)sizeof listener_addr), SRT_ERROR)
+        << srt_getlasterror_str();
+
+    ASSERT_TRUE(WaitReadable(m_listener_sock, 15000)) << "no connection was ever queued on the listener";
+
+    sockaddr_in accept_addr;
+    int         accept_len = (int)sizeof accept_addr;
+    m_accepted_sock        = srt_accept(m_listener_sock, (sockaddr*)&accept_addr, &accept_len);
+    ASSERT_NE(m_accepted_sock, SRT_INVALID_SOCK) << srt_getlasterror_str();
+    EXPECT_EQ(accept_addr.sin_addr.s_addr, caller_addr.sin_addr.s_addr);
+    EXPECT_EQ(accept_addr.sin_port, caller_addr.sin_port);
+
+    // The wire-level pins on the caller's opening flight: a CONCLUSION of
+    // HS_VERSION_SRT1 with no cookie - there was no Induction response to
+    // take a cookie from. (The version constant is taken by value:
+    // CUDT::HS_VERSION_SRT1 has no out-of-class definition to ODR-use.)
+    const int       hs_version_srt1 = srt::CUDT::HS_VERSION_SRT1;
+    srt::CHandShake first_flight;
+    ExpectFirstHandshake(m_caller_wire, srt::URQ_CONCLUSION, &first_flight);
+    ASSERT_EQ(first_flight.m_iVersion, hs_version_srt1);
+    ASSERT_EQ(first_flight.m_iCookie, 0);
+
+    // The first flight must also carry the HSv5 extension blocks (HSREQ is
+    // serialized after the bare handshake structure), which a stock
+    // Induction never has.
+    {
+        std::vector<char> first;
+        {
+            std::lock_guard<std::mutex> lock(m_caller_wire.first_datagram_lock);
+            first = m_caller_wire.first_datagram;
+        }
+        EXPECT_GT(first.size(), srt::CPacket::HDR_SIZE + srt::CHandShake::m_iContentSize)
+            << "the conclusion-first flight carries no handshake extension blocks";
+    }
+
+    EXPECT_EQ(srt_getsockstate(m_caller_sock), SRTS_CONNECTED);
+    EXPECT_EQ(srt_getsockstate(m_accepted_sock), SRTS_CONNECTED);
+
+    // One payload message each way over the conclusion-first connection.
+    const char* payload     = "skip-induction round trip";
+    const int   payload_len = (int)strlen(payload);
+    char        buf[1456];
+
+    ASSERT_EQ(srt_sendmsg(m_caller_sock, payload, payload_len, SRT_MSGTTL_INF, false), payload_len)
+        << srt_getlasterror_str();
+    ASSERT_TRUE(WaitReadable(m_accepted_sock, 5000)) << "the accepted socket never became read-ready";
+    ASSERT_EQ(srt_recvmsg(m_accepted_sock, buf, (int)sizeof buf), payload_len) << srt_getlasterror_str();
+    EXPECT_EQ(memcmp(buf, payload, payload_len), 0);
+
+    ASSERT_EQ(srt_sendmsg(m_accepted_sock, payload, payload_len, SRT_MSGTTL_INF, false), payload_len)
+        << srt_getlasterror_str();
+    ASSERT_TRUE(WaitReadable(m_caller_sock, 5000)) << "the caller never became read-ready";
+    ASSERT_EQ(srt_recvmsg(m_caller_sock, buf, (int)sizeof buf), payload_len) << srt_getlasterror_str();
+    EXPECT_EQ(memcmp(buf, payload, payload_len), 0);
+
+    // Clean close - the shutdown flights go through the wires too.
+    EXPECT_EQ(srt_close(m_accepted_sock), SRT_STATUS_OK) << srt_getlasterror_str();
+    m_accepted_sock = SRT_INVALID_SOCK;
+    EXPECT_EQ(srt_close(m_caller_sock), SRT_STATUS_OK) << srt_getlasterror_str();
+    m_caller_sock = SRT_INVALID_SOCK;
+    EXPECT_EQ(srt_close(m_listener_sock), SRT_STATUS_OK) << srt_getlasterror_str();
+    m_listener_sock = SRT_INVALID_SOCK;
+}
+
+// The per-multiplexer gate of skip_induction: the cookie bypass belongs to
+// the listener's OWN bind configuration, not to the medium. A listener
+// bound without skip_induction must keep the stock cookie validation even
+// against a conclusion-first request that arrived over a virtual
+// transport: a wrong cookie (0, as a skip caller sends) is silently
+// ignored, no connection may ever be queued on it, and the listener stays
+// in the listening state. The caller observes the refusal through its
+// bounded connect timeout. This pins that skip_induction is a contract
+// between the two endpoints' configs, not a global property of the
+// virtual transport seam.
+TEST_F(TestVirtualTransport, VirtualListenerWithoutSkipStillRequiresCookie)
+{
+    const sockaddr_in listener_addr = FillV4("10.216.0.2", 5555);
+    const sockaddr_in caller_addr   = FillV4("10.216.0.1", 5556);
+
+    PairWires(caller_addr, listener_addr);
+
+    // Listener side: the stock config - no skip_induction.
+    m_listener_sock = srt_create_socket();
+    ASSERT_NE(m_listener_sock, SRT_INVALID_SOCK);
+    m_listener_wire.sock = m_listener_sock;
+    {
+        const SRT_VirtualTransportConfig cfg = m_listener_queue.getConfig();
+        ASSERT_EQ(srt_bind_virtual(m_listener_sock, (const sockaddr*)&listener_addr, (int)sizeof listener_addr, &cfg),
+                  SRT_STATUS_OK)
+            << srt_getlasterror_str();
+    }
+    ASSERT_NE(srt_listen(m_listener_sock, 4), SRT_ERROR) << srt_getlasterror_str();
+
+    // Caller side: skip_induction, so its opening flight is a cookie-0
+    // CONCLUSION. The connect timeout bounds the refusal: the listener
+    // ignores every retransmission of the wrong-cookie request, so the
+    // caller can only run out of its connect timeout.
+    m_caller_sock = srt_create_socket();
+    ASSERT_NE(m_caller_sock, SRT_INVALID_SOCK);
+    m_caller_wire.sock = m_caller_sock;
+    const int conn_timeout_ms = 500;
+    ASSERT_NE(srt_setsockopt(m_caller_sock, 0, SRTO_CONNTIMEO, &conn_timeout_ms, sizeof conn_timeout_ms), SRT_ERROR)
+        << srt_getlasterror_str();
+    {
+        const SRT_VirtualTransportConfig cfg = m_caller_queue.getConfig(0, 1);
+        ASSERT_EQ(srt_bind_virtual(m_caller_sock, (const sockaddr*)&caller_addr, (int)sizeof caller_addr, &cfg),
+                  SRT_STATUS_OK)
+            << srt_getlasterror_str();
+    }
+
+    EXPECT_EQ(srt_connect(m_caller_sock, (const sockaddr*)&listener_addr, (int)sizeof listener_addr), SRT_ERROR);
+    // The bounded refusal: the caller can only run out of its connect
+    // timeout, the shape the wrong-cookie silence produces.
+    ExpectLastErrno(SRT_ENOSERVER);
+
+    // The refusal was about the listener's missing skip config, not about
+    // the caller's opening flight: it was the conclusion-first shape.
+    const int       hs_version_srt1 = srt::CUDT::HS_VERSION_SRT1;
+    srt::CHandShake first_flight;
+    ExpectFirstHandshake(m_caller_wire, srt::URQ_CONCLUSION, &first_flight);
+    ASSERT_EQ(first_flight.m_iVersion, hs_version_srt1);
+    ASSERT_EQ(first_flight.m_iCookie, 0);
+
+    // Nothing was ever queued on the listener, and it stays listening.
+    EXPECT_FALSE(WaitReadable(m_listener_sock, 500)) << "a connection was queued on the listener without skip_induction";
+    EXPECT_EQ(srt_getsockstate(m_listener_sock), SRTS_LISTENING);
+
+    // Both sockets close cleanly after the refused handshake.
+    EXPECT_EQ(srt_close(m_caller_sock), SRT_STATUS_OK) << srt_getlasterror_str();
+    m_caller_sock = SRT_INVALID_SOCK;
+    EXPECT_EQ(srt_close(m_listener_sock), SRT_STATUS_OK) << srt_getlasterror_str();
+    m_listener_sock = SRT_INVALID_SOCK;
+}
+
+// The seed must survive the connection completion on both sides: the
+// caller's through postConnect, the accepted socket's through
+// acceptAndRespond - both of which consult a per-peer-address RTT cache
+// keyed by the peer label, and a virtual transport label is an
+// owner-assigned identity that repeats across sessions. The trap is
+// therefore sprung inside this test: a FIRST session on a pair of labels
+// drives the live RTT far below the seed, and a SECOND session reusing
+// the very same labels (through a fresh listener, so the duplicate-label
+// rule of the multiplexer is not involved) must still come up seeded -
+// a cache-consulting implementation would restore the first session's
+// stale live values instead. The first live ACK/ACKACK samples must then
+// replace the seed with the true in-memory RTT.
+TEST_F(TestVirtualTransport, InitialRTTSeedViaConfigThenLiveReplace)
+{
+    // Reused by the second session below - that is the point of this test.
+    const sockaddr_in listener_addr = FillV4("10.217.0.2", 5555);
+    const sockaddr_in caller_addr   = FillV4("10.217.0.1", 5556);
+
+    const int seed_rtt_ms    = 300;
+    const int rcv_timeout_ms = 5000;
+
+    // ---- First session: seed, verify the seed, then replace it live. ----
+
+    PairWires(caller_addr, listener_addr);
+
+    m_listener_sock = srt_create_socket();
+    ASSERT_NE(m_listener_sock, SRT_INVALID_SOCK);
+    m_listener_wire.sock = m_listener_sock;
+    {
+        // Both endpoints skip the Induction round trip (the phase that
+        // normally delivers the first RTT sample) and seed the estimator
+        // explicitly, as a WebTransport gateway does with the QUIC
+        // smoothed RTT.
+        const SRT_VirtualTransportConfig cfg = m_listener_queue.getConfig(seed_rtt_ms, 1);
+        ASSERT_EQ(srt_bind_virtual(m_listener_sock, (const sockaddr*)&listener_addr, (int)sizeof listener_addr, &cfg),
+                  SRT_STATUS_OK)
+            << srt_getlasterror_str();
+    }
+    ASSERT_NE(srt_listen(m_listener_sock, 4), SRT_ERROR) << srt_getlasterror_str();
+
+    m_caller_sock = srt_create_socket();
+    ASSERT_NE(m_caller_sock, SRT_INVALID_SOCK);
+    m_caller_wire.sock = m_caller_sock;
+    ASSERT_NE(srt_setsockopt(m_caller_sock, 0, SRTO_RCVTIMEO, &rcv_timeout_ms, sizeof rcv_timeout_ms), SRT_ERROR)
+        << srt_getlasterror_str();
+    {
+        const SRT_VirtualTransportConfig cfg = m_caller_queue.getConfig(seed_rtt_ms, 1);
+        ASSERT_EQ(srt_bind_virtual(m_caller_sock, (const sockaddr*)&caller_addr, (int)sizeof caller_addr, &cfg),
+                  SRT_STATUS_OK)
+            << srt_getlasterror_str();
+    }
+
+    ASSERT_NE(srt_connect(m_caller_sock, (const sockaddr*)&listener_addr, (int)sizeof listener_addr), SRT_ERROR)
+        << srt_getlasterror_str();
+
+    ASSERT_TRUE(WaitReadable(m_listener_sock, 15000)) << "no connection was ever queued on the listener";
+
+    sockaddr_in accept_addr;
+    int         accept_len = (int)sizeof accept_addr;
+    m_accepted_sock        = srt_accept(m_listener_sock, (sockaddr*)&accept_addr, &accept_len);
+    ASSERT_NE(m_accepted_sock, SRT_INVALID_SOCK) << srt_getlasterror_str();
+    ASSERT_NE(srt_setsockopt(m_accepted_sock, 0, SRTO_RCVTIMEO, &rcv_timeout_ms, sizeof rcv_timeout_ms), SRT_ERROR)
+        << srt_getlasterror_str();
+
+    // Pre-data: no ACK/ACKACK samples exist yet, so both estimators must
+    // still hold the seed (300 ms), not the open()-time default.
+    {
+        SRT_TRACEBSTATS perf;
+        ASSERT_EQ(srt_bstats(m_caller_sock, &perf, 0), 0);
+        EXPECT_DOUBLE_EQ(perf.msRTT, (double)seed_rtt_ms) << "caller: the seed did not survive postConnect";
+        ASSERT_EQ(srt_bstats(m_accepted_sock, &perf, 0), 0);
+        EXPECT_DOUBLE_EQ(perf.msRTT, (double)seed_rtt_ms) << "accepted: the seed did not survive acceptAndRespond";
+    }
+
+    // Round trips of payload make both sides measure the true (in-memory,
+    // sub-millisecond) RTT; the live samples must replace the seed.
+    const char* payload     = "initial RTT seed";
+    const int   payload_len = (int)strlen(payload);
+    char        buf[1456];
+
+    for (int i = 0; i < 20; ++i)
+    {
+        ASSERT_EQ(srt_sendmsg(m_caller_sock, payload, payload_len, SRT_MSGTTL_INF, false), payload_len)
+            << srt_getlasterror_str();
+        ASSERT_EQ(srt_recvmsg(m_accepted_sock, buf, (int)sizeof buf), payload_len) << srt_getlasterror_str();
+        ASSERT_EQ(srt_sendmsg(m_accepted_sock, payload, payload_len, SRT_MSGTTL_INF, false), payload_len)
+            << srt_getlasterror_str();
+        ASSERT_EQ(srt_recvmsg(m_caller_sock, buf, (int)sizeof buf), payload_len) << srt_getlasterror_str();
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    {
+        SRT_TRACEBSTATS perf;
+        ASSERT_EQ(srt_bstats(m_caller_sock, &perf, 0), 0);
+        EXPECT_LT(perf.msRTT, 100.0) << "caller: the live RTT did not replace the seed";
+        ASSERT_EQ(srt_bstats(m_accepted_sock, &perf, 0), 0);
+        EXPECT_LT(perf.msRTT, 100.0) << "accepted: the live RTT did not replace the seed";
+    }
+
+    EXPECT_EQ(srt_close(m_accepted_sock), SRT_STATUS_OK) << srt_getlasterror_str();
+    m_accepted_sock = SRT_INVALID_SOCK;
+    EXPECT_EQ(srt_close(m_caller_sock), SRT_STATUS_OK) << srt_getlasterror_str();
+    m_caller_sock = SRT_INVALID_SOCK;
+    EXPECT_EQ(srt_close(m_listener_sock), SRT_STATUS_OK) << srt_getlasterror_str();
+    m_listener_sock = SRT_INVALID_SOCK;
+
+    // ---- Second session on the SAME labels, through a FRESH listener. ----
+    //
+    // A closing socket would hand its last RTT values to the per-address
+    // cache keyed by the peer label (the first session just closed two
+    // such sockets), and a cache hit in postConnect (peer = the listener
+    // label) or acceptAndRespond (peer = the caller label) would override
+    // the configured seed with the first session's stale live values. The
+    // virtual transport config must skip the cache on both sides. The
+    // fresh listener keeps the duplicate-source-label rule out of the
+    // picture: its brand new multiplexer serves no socket yet.
+
+    m_listener_sock = srt_create_socket();
+    ASSERT_NE(m_listener_sock, SRT_INVALID_SOCK);
+    {
+        const SRT_VirtualTransportConfig cfg = m_listener_queue.getConfig(seed_rtt_ms, 1);
+        ASSERT_EQ(srt_bind_virtual(m_listener_sock, (const sockaddr*)&listener_addr, (int)sizeof listener_addr, &cfg),
+                  SRT_STATUS_OK)
+            << srt_getlasterror_str();
+    }
+    ASSERT_NE(srt_listen(m_listener_sock, 4), SRT_ERROR) << srt_getlasterror_str();
+
+    m_caller_sock = srt_create_socket();
+    ASSERT_NE(m_caller_sock, SRT_INVALID_SOCK);
+    {
+        const SRT_VirtualTransportConfig cfg = m_caller_queue.getConfig(seed_rtt_ms, 1);
+        ASSERT_EQ(srt_bind_virtual(m_caller_sock, (const sockaddr*)&caller_addr, (int)sizeof caller_addr, &cfg),
+                  SRT_STATUS_OK)
+            << srt_getlasterror_str();
+    }
+
+    ASSERT_NE(srt_connect(m_caller_sock, (const sockaddr*)&listener_addr, (int)sizeof listener_addr), SRT_ERROR)
+        << srt_getlasterror_str();
+
+    ASSERT_TRUE(WaitReadable(m_listener_sock, 15000)) << "no connection was ever queued on the second listener";
+
+    accept_len      = (int)sizeof accept_addr;
+    m_accepted_sock = srt_accept(m_listener_sock, (sockaddr*)&accept_addr, &accept_len);
+    ASSERT_NE(m_accepted_sock, SRT_INVALID_SOCK) << srt_getlasterror_str();
+
+    // Pre-data again, on the reused labels: the seed, not the first
+    // session's leftovers.
+    {
+        SRT_TRACEBSTATS perf;
+        ASSERT_EQ(srt_bstats(m_caller_sock, &perf, 0), 0);
+        EXPECT_DOUBLE_EQ(perf.msRTT, (double)seed_rtt_ms)
+            << "caller: a stale per-address cache value replaced the seed on the reused label";
+        ASSERT_EQ(srt_bstats(m_accepted_sock, &perf, 0), 0);
+        EXPECT_DOUBLE_EQ(perf.msRTT, (double)seed_rtt_ms)
+            << "accepted: a stale per-address cache value replaced the seed on the reused label";
+    }
+
+    EXPECT_EQ(srt_close(m_accepted_sock), SRT_STATUS_OK) << srt_getlasterror_str();
+    m_accepted_sock = SRT_INVALID_SOCK;
+    EXPECT_EQ(srt_close(m_caller_sock), SRT_STATUS_OK) << srt_getlasterror_str();
+    m_caller_sock = SRT_INVALID_SOCK;
+    EXPECT_EQ(srt_close(m_listener_sock), SRT_STATUS_OK) << srt_getlasterror_str();
+    m_listener_sock = SRT_INVALID_SOCK;
+}
+
+// SRTO_RENDEZVOUS has no virtual transport counterpart: a rendezvous
+// connection has no listener that could accept a Conclusion-first
+// handshake, so the cookie-less opener cannot be authenticated by either
+// side. srt_bind_virtual() refuses a socket that has rendezvous already
+// set (pinned by BindVirtualDoubleBindRejected); this test covers the
+// reverse order - rendezvous set AFTER the virtual bind - where the
+// refusal happens at connect time, inside startConnect, with the
+// MJ_NOTSUP/MN_INVAL error. The refused connect must also leave the
+// socket closable without a hang: the refusal unregisters the connector
+// before throwing, and an entry abandoned in the rendezvous queue would
+// otherwise live until its TTL (the rendezvous connect timeout times
+// ten) and deadlock the close against the receiving worker.
+TEST_F(TestVirtualTransport, RendezvousWithVirtualRejected)
+{
+    const sockaddr_in self_addr = FillV4("10.218.0.1", 5555);
+    const sockaddr_in peer_addr = FillV4("10.218.0.2", 5555);
+
+    // A skip-induction multiplexer, the config the refusal is guarding.
+    m_caller_sock = srt_create_socket();
+    ASSERT_NE(m_caller_sock, SRT_INVALID_SOCK);
+    m_caller_wire.sock = m_caller_sock;
+    {
+        const SRT_VirtualTransportConfig cfg = m_caller_queue.getConfig(0, 1);
+        ASSERT_EQ(srt_bind_virtual(m_caller_sock, (const sockaddr*)&self_addr, (int)sizeof self_addr, &cfg),
+                  SRT_STATUS_OK)
+            << srt_getlasterror_str();
+    }
+
+    // Rendezvous set AFTER the virtual bind: accepted at set time (the
+    // option only demands that the socket not be connecting yet)...
+    const int yes = 1;
+    ASSERT_NE(srt_setsockopt(m_caller_sock, 0, SRTO_RENDEZVOUS, &yes, sizeof yes), SRT_ERROR)
+        << srt_getlasterror_str();
+
+    // ...but refused at connect time, synchronously - the refusal must
+    // not decay into a waveahand-retransmit loop ended by a timeout. The
+    // measured duration doubles as the guard against that regression.
+    const std::chrono::steady_clock::time_point connect_start = std::chrono::steady_clock::now();
+    EXPECT_EQ(srt_connect(m_caller_sock, (const sockaddr*)&peer_addr, (int)sizeof peer_addr), SRT_ERROR);
+    // MJ_NOTSUP/MN_INVAL, the synchronous refusal of startConnect.
+    ExpectLastErrno(SRT_EINVPARAM);
+    const long long connect_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                     std::chrono::steady_clock::now() - connect_start)
+                                     .count();
+    EXPECT_LT(connect_ms, 1500) << "the refusal took the retransmit-until-timeout path";
+
+    // The CRITICAL pin: closing the refused socket must not hang. The
+    // connector must have been unregistered at throw time; a leaked entry
+    // would stall the close until the rendezvous-queue TTL expires (tens
+    // of seconds with the default connect timeout), far past this bound.
+    const std::chrono::steady_clock::time_point close_start = std::chrono::steady_clock::now();
+    EXPECT_EQ(srt_close(m_caller_sock), SRT_STATUS_OK) << srt_getlasterror_str();
+    const long long close_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - close_start).count();
+    EXPECT_LT(close_ms, 10000) << "closing the refused rendezvous socket stalled - a connector leaked into the queue";
+    m_caller_sock = SRT_INVALID_SOCK;
+}
+
+// The peer-label uniqueness rule of a virtual multiplexer: the source
+// label is an owner-assigned identity, so a second caller reusing the
+// label of a connection the listener already serves must be rejected -
+// two concurrent connections sharing one label would make the per-socket
+// link data ambiguous. The first connection must be unaffected: it keeps
+// passing data, and repeats of ITS handshake (same peer socket id and
+// ISN) keep being re-answered rather than caught by the duplicate rule.
+TEST_F(TestVirtualTransport, DuplicateSourceLabelRejected)
+{
+    const sockaddr_in listener_addr = FillV4("10.219.0.2", 5555);
+    // The shared source label: both callers report it to the listener.
+    const sockaddr_in shared_addr = FillV4("10.219.0.1", 5556);
+
+    PairWires(shared_addr, listener_addr);
+
+    // The listener in the intended mode: skip_induction.
+    m_listener_sock = srt_create_socket();
+    ASSERT_NE(m_listener_sock, SRT_INVALID_SOCK);
+    m_listener_wire.sock = m_listener_sock;
+    {
+        const SRT_VirtualTransportConfig cfg = m_listener_queue.getConfig(0, 1);
+        ASSERT_EQ(srt_bind_virtual(m_listener_sock, (const sockaddr*)&listener_addr, (int)sizeof listener_addr, &cfg),
+                  SRT_STATUS_OK)
+            << srt_getlasterror_str();
+    }
+    ASSERT_NE(srt_listen(m_listener_sock, 4), SRT_ERROR) << srt_getlasterror_str();
+
+    // The FIRST caller on the label connects fine.
+    m_caller_sock = srt_create_socket();
+    ASSERT_NE(m_caller_sock, SRT_INVALID_SOCK);
+    m_caller_wire.sock = m_caller_sock;
+    {
+        const SRT_VirtualTransportConfig cfg = m_caller_queue.getConfig(0, 1);
+        ASSERT_EQ(srt_bind_virtual(m_caller_sock, (const sockaddr*)&shared_addr, (int)sizeof shared_addr, &cfg),
+                  SRT_STATUS_OK)
+            << srt_getlasterror_str();
+    }
+
+    ASSERT_NE(srt_connect(m_caller_sock, (const sockaddr*)&listener_addr, (int)sizeof listener_addr), SRT_ERROR)
+        << srt_getlasterror_str();
+
+    ASSERT_TRUE(WaitReadable(m_listener_sock, 15000)) << "no connection was ever queued on the listener";
+
+    sockaddr_in accept_addr;
+    int         accept_len = (int)sizeof accept_addr;
+    m_accepted_sock        = srt_accept(m_listener_sock, (sockaddr*)&accept_addr, &accept_len);
+    ASSERT_NE(m_accepted_sock, SRT_INVALID_SOCK) << srt_getlasterror_str();
+
+    const int rcv_timeout_ms = 5000;
+    ASSERT_NE(srt_setsockopt(m_caller_sock, 0, SRTO_RCVTIMEO, &rcv_timeout_ms, sizeof rcv_timeout_ms), SRT_ERROR)
+        << srt_getlasterror_str();
+    ASSERT_NE(srt_setsockopt(m_accepted_sock, 0, SRTO_RCVTIMEO, &rcv_timeout_ms, sizeof rcv_timeout_ms), SRT_ERROR)
+        << srt_getlasterror_str();
+
+    // Sanity: the first connection passes data before the duplicate
+    // arrives, and its opening flight was the conclusion-first shape.
+    ExpectFirstHandshake(m_caller_wire, srt::URQ_CONCLUSION);
+    const char* payload     = "first connection stays alive";
+    const int   payload_len = (int)strlen(payload);
+    char        buf[1456];
+    ASSERT_EQ(srt_sendmsg(m_caller_sock, payload, payload_len, SRT_MSGTTL_INF, false), payload_len)
+        << srt_getlasterror_str();
+    ASSERT_EQ(srt_recvmsg(m_accepted_sock, buf, (int)sizeof buf), payload_len) << srt_getlasterror_str();
+
+    // The SECOND caller on the SAME label, through its own queue and wire
+    // (the listener's responses route back over the shared label to the
+    // first caller's queue, so the second caller observes the refusal
+    // through its bounded connect timeout).
+    Wire                   dup_wire;
+    srt::SRTTransportQueue dup_queue(&WireSend, &dup_wire);
+    dup_wire.peer = &m_listener_queue;
+    FillWireSource(dup_wire, shared_addr);
+    SRTSOCKET dup_sock = srt_create_socket();
+    ASSERT_NE(dup_sock, SRT_INVALID_SOCK);
+    dup_wire.sock = dup_sock;
+    {
+        const SRT_VirtualTransportConfig cfg = dup_queue.getConfig(0, 1);
+        ASSERT_EQ(srt_bind_virtual(dup_sock, (const sockaddr*)&shared_addr, (int)sizeof shared_addr, &cfg),
+                  SRT_STATUS_OK)
+            << srt_getlasterror_str();
+    }
+    const int conn_timeout_ms = 500;
+    ASSERT_NE(srt_setsockopt(dup_sock, 0, SRTO_CONNTIMEO, &conn_timeout_ms, sizeof conn_timeout_ms), SRT_ERROR)
+        << srt_getlasterror_str();
+
+    EXPECT_EQ(srt_connect(dup_sock, (const sockaddr*)&listener_addr, (int)sizeof listener_addr), SRT_ERROR);
+    // The refusal observed from the second caller: bounded by its connect
+    // timeout, as the rejection response routes to the first caller.
+    ExpectLastErrno(SRT_ENOSERVER);
+
+    // The refusal was a rejection, not a queueing: no second connection
+    // may appear on the listener, and the listener stays listening.
+    EXPECT_FALSE(WaitReadable(m_listener_sock, 500)) << "a second connection was queued from the duplicate label";
+    EXPECT_EQ(srt_getsockstate(m_listener_sock), SRTS_LISTENING);
+
+    // The FIRST connection still passes data, both ways, after the
+    // duplicate was rejected.
+    ASSERT_EQ(srt_sendmsg(m_caller_sock, payload, payload_len, SRT_MSGTTL_INF, false), payload_len)
+        << srt_getlasterror_str();
+    ASSERT_EQ(srt_recvmsg(m_accepted_sock, buf, (int)sizeof buf), payload_len) << srt_getlasterror_str();
+    ASSERT_EQ(srt_sendmsg(m_accepted_sock, payload, payload_len, SRT_MSGTTL_INF, false), payload_len)
+        << srt_getlasterror_str();
+    ASSERT_EQ(srt_recvmsg(m_caller_sock, buf, (int)sizeof buf), payload_len) << srt_getlasterror_str();
+
+    // Close the duplicate before its local wire and queue go away.
+    EXPECT_EQ(srt_close(dup_sock), SRT_STATUS_OK) << srt_getlasterror_str();
+
+    // Repeats of the FIRST connection's handshake keep being re-answered:
+    // replay the captured opening flight into the listener's queue. The
+    // re-answer is observed on the listener's wire - the response
+    // datagram leaves through it - while the duplicate rule would have
+    // swallowed the request with no listener response at all. The replay
+    // must also not queue anything new.
+    std::vector<char> replay;
+    {
+        std::lock_guard<std::mutex> lock(m_caller_wire.first_datagram_lock);
+        replay = m_caller_wire.first_datagram;
+    }
+    ASSERT_FALSE(replay.empty());
+    const long long sends_before = m_listener_wire.send_count.load();
+    ASSERT_EQ(m_listener_queue.push(replay.data(), replay.size(), (const struct sockaddr*)&shared_addr,
+                                    (int)sizeof shared_addr),
+              0);
+
+    bool reanswered = false;
+    for (int i = 0; i < 500 && !reanswered; ++i)
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        reanswered = m_listener_wire.send_count.load() > sends_before;
+    }
+    EXPECT_TRUE(reanswered) << "the repeat handshake of the existing connection was not re-answered";
+
+    EXPECT_FALSE(WaitReadable(m_listener_sock, 500)) << "the replayed handshake queued a second connection";
+    EXPECT_EQ(srt_getsockstate(m_listener_sock), SRTS_LISTENING);
+
+    // And the first connection is still fully alive after the replay.
+    ASSERT_EQ(srt_sendmsg(m_caller_sock, payload, payload_len, SRT_MSGTTL_INF, false), payload_len)
+        << srt_getlasterror_str();
+    ASSERT_EQ(srt_recvmsg(m_accepted_sock, buf, (int)sizeof buf), payload_len) << srt_getlasterror_str();
+
+    // Clean close - the first connection and the listener.
     EXPECT_EQ(srt_close(m_accepted_sock), SRT_STATUS_OK) << srt_getlasterror_str();
     m_accepted_sock = SRT_INVALID_SOCK;
     EXPECT_EQ(srt_close(m_caller_sock), SRT_STATUS_OK) << srt_getlasterror_str();
