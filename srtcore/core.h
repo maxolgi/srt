@@ -317,6 +317,7 @@ public: //API
 #endif
     static SRTSTATUS bind(SRTSOCKET u, const sockaddr* name, int namelen);
     static SRTSTATUS bind(SRTSOCKET u, SYSSOCKET udpsock);
+    static SRTSTATUS bind_virtual(SRTSOCKET u, const sockaddr* name, int namelen, const SRT_VirtualTransportConfig* vtcfg);
     static SRTSTATUS listen(SRTSOCKET u, int backlog);
     static SRTSOCKET accept(SRTSOCKET u, sockaddr* addr, int* addrlen);
     static SRTSOCKET accept_bond(const SRTSOCKET listeners [], int lsize, int64_t msTimeOut);

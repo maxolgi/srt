@@ -350,6 +350,7 @@ public:
 
     SRTSTATUS bind(CUDTSocket* u, const sockaddr_any& name);
     SRTSTATUS bind(CUDTSocket* u, SYSSOCKET udpsock);
+    SRTSTATUS bind_virtual(CUDTSocket* s, const sockaddr_any& name, const SRT_VirtualTransportConfig* vtcfg);
     SRTSTATUS listen(const SRTSOCKET u, int backlog);
     SRTSOCKET accept(const SRTSOCKET listen, sockaddr* addr, int* addrlen);
     SRTSOCKET accept_bond(const SRTSOCKET listeners[], int lsize, int64_t msTimeOut);
@@ -591,10 +592,11 @@ private:
 
 private:
 
-    void bindSocketToMuxer(CUDTSocket* s, const sockaddr_any& address, SYSSOCKET* psocket = NULL)
+    void bindSocketToMuxer(CUDTSocket* s, const sockaddr_any& address, SYSSOCKET* psocket = NULL,
+                           const SRT_VirtualTransportConfig* vtcfg = NULL)
     SRT_TSA_NEEDS_LOCKED(s->m_ControlLock);
 
-    void updateMux(CUDTSocket* s, const sockaddr_any& addr, const SYSSOCKET* = NULL);
+    void updateMux(CUDTSocket* s, const sockaddr_any& addr, const SYSSOCKET* = NULL, const SRT_VirtualTransportConfig* vtcfg = NULL);
     bool updateListenerMux(CUDTSocket* s, const CUDTSocket* ls);
 
     SRT_TSA_NEEDS_LOCKED(m_GlobControlLock)

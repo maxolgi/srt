@@ -869,6 +869,24 @@ typedef struct SRT_VirtualTransportConfig_
     int                               skip_induction; // 0/1: skip the induction phase of the handshake
 } SRT_VirtualTransportConfig;
 
+// Bind a socket to a virtual transport, instead of an OS UDP socket. Like
+// srt_bind(), this binds the unbound and unconnected socket @u to @name, but
+// the socket then gets a DEDICATED multiplexer whose channel exchanges
+// datagrams through the callbacks of @cfg; normal srt_listen/srt_connect and
+// accept connections then run over it. The address in @name is only a label:
+// nothing is bound in the OS, srt_getsockname() reports it exactly as given
+// (a port 0 is not autoselected and stays 0), and it is passed as the source
+// address to the send callback. Rendezvous sockets are not supported.
+// @cfg must have all three callbacks set, initial_rtt_ms in 0..30000 and
+// skip_induction 0 or 1 (SRT_EINVPARAM otherwise). A socket can be bound
+// only once, like with srt_bind(). In builds without
+// ENABLE_VIRTUAL_TRANSPORT this function always fails with SRT_EINVOP
+// ("Operation not supported", the "not supported" error code; the old
+// experimental branch documented SRT_EINVPARAM, but the feature being
+// merely absent is not a bad parameter) and sets the last-error state.
+SRT_API       SRTSTATUS srt_bind_virtual(SRTSOCKET u, const struct sockaddr* name, int namelen,
+                                        const SRT_VirtualTransportConfig* cfg);
+
 SRT_API       SRTSTATUS srt_close        (SRTSOCKET u);
 SRT_API       SRTSTATUS srt_close_withreason(SRTSOCKET u, int reason);
 SRT_API       SRTSTATUS srt_close_getreason(SRTSOCKET u, SRT_CLOSE_INFO* info);

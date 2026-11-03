@@ -1179,55 +1179,71 @@ bool CMultiplexer::qualifyToHandleRID(EReadStatus    rst,
     return !toRemove.empty() || !toProcess.empty();
 }
 
-void CMultiplexer::configure(int32_t id, const CSrtConfig& config, const sockaddr_any& reqaddr, const SYSSOCKET* udpsock)
+void CMultiplexer::configure(int32_t id, const CSrtConfig& config, const sockaddr_any& reqaddr, const SYSSOCKET* udpsock,
+        const SRT_VirtualTransportConfig* vtcfg)
 {
     m_mcfg = config;
     m_iID  = id;
 
-    // The channel class is abstracted out; keep the dynamic type
-    // as the CChannel base, with the UDP implementation underneath.
-    CChannelUDP* chan = new CChannelUDP();
-    m_pChannel = chan;
-    m_pChannel->setConfig(m_mcfg);
-
-    if (udpsock)
+    if (vtcfg)
     {
-        // In this case, reqaddr contains the address
-        // that has been extracted already from the
-        // given socket
-        chan->attach(*udpsock, reqaddr);
-    }
-    else if (reqaddr.empty())
-    {
-        // If reqaddr was set as empty, only with set family,
-        // just automatically bind to the "0" address to autoselect
-        // everything.
-        chan->open(reqaddr.family());
+        // The channel of this multiplexer exchanges datagrams through the
+        // callbacks of *vtcfg instead of an OS UDP socket. Nothing is bound
+        // in the OS, so the channel reports the requested address as the
+        // local one, exactly as given - unlike on the UDP path below, a
+        // port 0 is not autoselected by the system and stays 0. There is
+        // also no IPV6_V6ONLY sockopt to query.
+        m_pChannel = new CChannelVirtual(*vtcfg, reqaddr);
+        m_pChannel->setConfig(m_mcfg);
+        m_SelfAddr = m_pChannel->getSockAddr();
     }
     else
     {
-        // If at least the IP address is specified, then bind to that
-        // address, but still possibly autoselect the outgoing port, if the
-        // port was specified as 0.
-        chan->open(reqaddr);
-    }
+        // The channel class is abstracted out; keep the dynamic type
+        // as the CChannel base, with the UDP implementation underneath.
+        CChannelUDP* chan = new CChannelUDP();
+        m_pChannel = chan;
+        m_pChannel->setConfig(m_mcfg);
 
-    // After the system binding the 0 port could be reassigned by the
-    // system-selected port; extract it.
-    m_SelfAddr = m_pChannel->getSockAddr();
+        if (udpsock)
+        {
+            // In this case, reqaddr contains the address
+            // that has been extracted already from the
+            // given socket
+            chan->attach(*udpsock, reqaddr);
+        }
+        else if (reqaddr.empty())
+        {
+            // If reqaddr was set as empty, only with set family,
+            // just automatically bind to the "0" address to autoselect
+            // everything.
+            chan->open(reqaddr.family());
+        }
+        else
+        {
+            // If at least the IP address is specified, then bind to that
+            // address, but still possibly autoselect the outgoing port, if the
+            // port was specified as 0.
+            chan->open(reqaddr);
+        }
 
-    // AFTER OPENING, check the matter of IPV6_V6ONLY option,
-    // as it decides about the fact that the occupied binding address
-    // in case of wildcard is both :: and 0.0.0.0, or only ::.
-    if (reqaddr.family() == AF_INET6 && m_mcfg.iIpV6Only == -1)
-    {
-        // XXX We don't know how probable it is to get the error here
-        // and resulting -1 value. As a fallback for that case, the value -1
-        // is honored here, just all side-bindings for other sockes will be
-        // rejected as a potential conflict, even if binding would be accepted
-        // in these circumstances. Only a perfect match in case of potential
-        // overlapping will be accepted on the same port.
-        m_mcfg.iIpV6Only = chan->sockopt(IPPROTO_IPV6, IPV6_V6ONLY, -1);
+        // After the system binding the 0 port could be reassigned by the
+        // system-selected port; extract it.
+        m_SelfAddr = m_pChannel->getSockAddr();
+
+        // AFTER OPENING, check the matter of IPV6_V6ONLY option,
+        // as it decides about the fact that the occupied binding address
+        // in case of wildcard is both :: and 0.0.0.0, or only ::.
+        if (reqaddr.family() == AF_INET6 && m_mcfg.iIpV6Only == -1)
+        {
+            // XXX We don't know how probable it is to get the error here
+            // and resulting -1 value. As a fallback for that case, the value -1
+            // is honored here, just all side-bindings for other sockes will be
+            // rejected as a potential conflict, even if binding would be accepted
+            // in these circumstances. Only a perfect match in case of potential
+            // overlapping will be accepted on the same port.
+            m_mcfg.iIpV6Only = chan->sockopt(IPPROTO_IPV6, IPV6_V6ONLY, -1);
+        }
     }
 
     m_SndQueue.init(m_pChannel);

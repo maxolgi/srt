@@ -1279,13 +1279,44 @@ SRTSTATUS CUDTUnited::bind(CUDTSocket* s, SYSSOCKET udpsock)
     return SRT_STATUS_OK;
 }
 
-void CUDTUnited::bindSocketToMuxer(CUDTSocket* s, const sockaddr_any& address, SYSSOCKET* psocket)
+SRTSTATUS CUDTUnited::bind_virtual(CUDTSocket* s, const sockaddr_any& name, const SRT_VirtualTransportConfig* vtcfg)
+{
+    ScopedLock cg(s->m_ControlLock);
+
+    // cannot bind a socket more than once
+    if (s->m_Status != SRTS_INIT)
+        throw CUDTException(MJ_NOTSUP, MN_NONE, 0);
+
+    // The whole config must be usable as given - there are no
+    // virtual-transport socket options to fix it up later.
+    if (!vtcfg)
+        throw CUDTException(MJ_NOTSUP, MN_INVAL, 0);
+
+    if (!vtcfg->send || !vtcfg->waitread || !vtcfg->deliver)
+        throw CUDTException(MJ_NOTSUP, MN_INVAL, 0);
+
+    if (vtcfg->initial_rtt_ms < 0 || vtcfg->initial_rtt_ms > 30000)
+        throw CUDTException(MJ_NOTSUP, MN_INVAL, 0);
+
+    if (vtcfg->skip_induction != 0 && vtcfg->skip_induction != 1)
+        throw CUDTException(MJ_NOTSUP, MN_INVAL, 0);
+
+    // Rendezvous over a virtual transport is not supported.
+    if (s->core().m_config.bRendezvous)
+        throw CUDTException(MJ_NOTSUP, MN_ISRENDEZVOUS, 0);
+
+    bindSocketToMuxer(s, name, NULL, vtcfg);
+    return SRT_STATUS_OK;
+}
+
+void CUDTUnited::bindSocketToMuxer(CUDTSocket* s, const sockaddr_any& address, SYSSOCKET* psocket,
+        const SRT_VirtualTransportConfig* vtcfg)
 {
     if (address.hport() == 0 && s->core().m_config.bRendezvous)
         throw CUDTException(MJ_NOTSUP, MN_ISRENDUNBOUND, 0);
 
     s->core().open();
-    updateMux(s, address, psocket);
+    updateMux(s, address, psocket, vtcfg);
     // -> C(Snd|Rcv)Queue::init
     // -> pthread_create(...C(Snd|Rcv)Queue::worker...)
     s->m_Status = SRTS_OPENED;
@@ -3990,7 +4021,8 @@ bool CUDTUnited::channelSettingsMatch(const CSrtMuxerConfig& cfgMuxer, const CSr
     return false;
 }
 
-void CUDTUnited::updateMux(CUDTSocket* s, const sockaddr_any& reqaddr, const SYSSOCKET* udpsock /*[[nullable]]*/)
+void CUDTUnited::updateMux(CUDTSocket* s, const sockaddr_any& reqaddr, const SYSSOCKET* udpsock /*[[nullable]]*/,
+        const SRT_VirtualTransportConfig* vtcfg /*[[nullable]]*/)
 {
     ExclusiveLock cg(m_GlobControlLock);
 
@@ -3999,7 +4031,11 @@ void CUDTUnited::updateMux(CUDTSocket* s, const sockaddr_any& reqaddr, const SYS
     // a sanity check to see if this UDP socket isn't already installed
     // in some multiplexer, but we state this UDP socket isn't accessible
     // anyway so this wouldn't be possible.
-    if (!udpsock)
+    //
+    // With a virtual transport (vtcfg) the socket always gets a dedicated
+    // multiplexer - the transport callbacks belong to this one socket - so
+    // the search for a multiplexer to reuse is skipped entirely.
+    if (!udpsock && !vtcfg)
     {
         CMultiplexer* pmux = findSuitableMuxer(s, reqaddr);
         if (pmux)
@@ -4030,7 +4066,7 @@ void CUDTUnited::updateMux(CUDTSocket* s, const sockaddr_any& reqaddr, const SYS
             throw CUDTException(MJ_NOTSUP, MN_ISBOUND);
         }
         CMultiplexer& m = is.first;
-        m.configure(int32_t(s->id()), s->core().m_config, reqaddr, udpsock);
+        m.configure(int32_t(s->id()), s->core().m_config, reqaddr, udpsock, vtcfg);
         installMuxer((s), (&m));
     }
     catch (const CUDTException& x)
@@ -4081,6 +4117,12 @@ CMultiplexer* CUDTUnited::findSuitableMuxer(CUDTSocket* s, const sockaddr_any& r
         // Check if the address was reset. If so, this means this muxer is
         // about to be deleted, so definitely don't use it.
         if (mux_addr.family() == AF_UNSPEC)
+            continue;
+
+        // A virtual transport multiplexer is dedicated to the one socket
+        // that bound with SRT_VirtualTransportConfig; it is never a reuse
+        // candidate, for any bind.
+        if (m.channel()->isVirtual())
             continue;
 
         // First, we need to find a multiplexer with the same port.
@@ -4629,6 +4671,51 @@ SRTSTATUS CUDT::bind(SRTSOCKET u, SYSSOCKET udpsock)
     catch (const std::exception& ee)
     {
         LOGC(aclog.Fatal, log << "bind/udp: UNEXPECTED EXCEPTION: " << typeid(ee).name() << ": " << ee.what());
+        return APIError(MJ_UNKNOWN, MN_NONE, 0);
+    }
+}
+
+SRTSTATUS CUDT::bind_virtual(SRTSOCKET u, const sockaddr* name, int namelen, const SRT_VirtualTransportConfig* vtcfg)
+{
+    try
+    {
+#if !SRT_ENABLE_VIRTUAL_TRANSPORT
+        // The API function exists in every build so that programs can
+        // compile against any of them; a virtual transport can only be
+        // used in a build with ENABLE_VIRTUAL_TRANSPORT.
+        (void)u;
+        (void)name;
+        (void)namelen;
+        (void)vtcfg;
+        return APIError(MJ_NOTSUP, MN_NONE, 0); // SRT_EINVOP
+#else
+        sockaddr_any sa(name, namelen);
+        if (sa.len == 0)
+        {
+            // This happens if the namelen check proved it to be
+            // too small for particular family, or that family is
+            // not recognized (is none of AF_INET, AF_INET6).
+            // This is a user error.
+            return APIError(MJ_NOTSUP, MN_INVAL, 0);
+        }
+        CUDTSocket* s = uglobal().locateSocket(u);
+        if (!s)
+            return APIError(MJ_NOTSUP, MN_INVAL, 0);
+
+        return uglobal().bind_virtual(s, sa, vtcfg);
+#endif
+    }
+    catch (const CUDTException& e)
+    {
+        return APIError(e);
+    }
+    catch (bad_alloc&)
+    {
+        return APIError(MJ_SYSTEMRES, MN_MEMORY, 0);
+    }
+    catch (const std::exception& ee)
+    {
+        LOGC(aclog.Fatal, log << "bind_virtual: UNEXPECTED EXCEPTION: " << typeid(ee).name() << ": " << ee.what());
         return APIError(MJ_UNKNOWN, MN_NONE, 0);
     }
 }
