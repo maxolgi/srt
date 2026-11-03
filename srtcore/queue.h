@@ -993,6 +993,12 @@ public:
     CUDTSocket* findAgent(SRTSOCKET id, const sockaddr_any& remote_addr, SocketHolder::State& w_state, AcquisitionControl acq = ACQ_RELAXED);
     CUDTSocket* findPeer(SRTSOCKET id, const sockaddr_any& remote_addr, AcquisitionControl acq = ACQ_RELAXED);
 
+    /// @brief Check if any socket served by this multiplexer records the
+    /// given address as its peer address.
+    /// @param addr peer address to look for.
+    /// @return true if such a socket was found, false otherwise.
+    bool hasPeerAddr(const sockaddr_any& addr) const;
+
     /// @brief Remove a socket from the connection pending list.
     /// @param id socket ID.
     void removeRID(const SRTSOCKET& id);

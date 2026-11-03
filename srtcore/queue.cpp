@@ -2251,6 +2251,21 @@ CUDTSocket* CMultiplexer::findPeer(SRTSOCKET rid, const sockaddr_any& remote_add
     return point->m_pSocket;
 }
 
+/// Check if this multiplexer serves a socket that has
+/// the given address recorded as its peer address.
+bool CMultiplexer::hasPeerAddr(const sockaddr_any& addr) const
+{
+    sync::ScopedLock lk (m_SocketsLock);
+
+    for (std::list<SocketHolder>::const_iterator i = m_Sockets.begin(); i != m_Sockets.end(); ++i)
+    {
+        if (i->m_PeerAddr == addr)
+            return true;
+    }
+
+    return false;
+}
+
 steady_clock::time_point CMultiplexer::updateSendNormal(CUDTSocket* s)
 {
     const steady_clock::time_point currtime = steady_clock::now();

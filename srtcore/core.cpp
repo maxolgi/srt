@@ -12492,6 +12492,40 @@ int CUDT::processConnectRequest(const sockaddr_any& addr, CPacket& packet)
         accepted_hs    = false;
     }
 
+    // Rule for virtual transports: the peer address is an owner-assigned
+    // label, not a network address, and exactly one connection is expected
+    // to be identified by it. If a NEW connection request comes from an
+    // address that a socket already served by this multiplexer uses as its
+    // peer address, it must be rejected - two concurrent connections sharing
+    // one label would make the per-socket link data ambiguous. A repeated
+    // handshake of an already accepted connection (same peer socket id and
+    // ISN, as recognized by locatePeer) is exempt so that it can keep being
+    // re-answered in newConnection(). UDP listeners are unaffected: over UDP
+    // the same source address may legitimately carry unrelated connections
+    // (NAT), so this applies only when the channel is a virtual one.
+    if (m_pMuxer && m_pMuxer->channel()->vtconfig()
+            && uglobal().locatePeer(addr, hs.m_iID, hs.m_iISN) == NULL
+            && m_pMuxer->hasPeerAddr(addr))
+    {
+        // There's no dedicated reject reason for a duplicate peer address;
+        // SRT_REJ_BACKLOG is the closest existing one - like with an exceeded
+        // backlog, the listener currently cannot take another connection
+        // from this source address.
+        m_RejectReason = SRT_REJ_BACKLOG;
+        hs.m_iReqType  = URQFailure(m_RejectReason);
+        LOGC(cnlog.Note,
+              log << CONID() << "processConnectRequest: VIRTUAL channel: rejecting a new connection from "
+                  << addr.str() << " - this address is already handled by a socket of this multiplexer");
+        size_t size = CHandShake::m_iContentSize;
+        hs.store_to((packet.m_pcData), (size));
+        packet.setLength(size);
+        packet.set_id(id);
+        setPacketTS((packet), steady_clock::now());
+        HLOGC(cnlog.Debug, log << CONID() << "processConnectRequest: SENDING HS (v): " << hs.show());
+        channel()->sendto(addr, packet, use_source_addr);
+        return m_RejectReason;
+    }
+
     if (!accepted_hs)
     {
         HLOGC(cnlog.Debug,
