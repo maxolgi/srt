@@ -2781,6 +2781,21 @@ SRTSTATUS CUDTUnited::close(CUDTSocket* s, int reason)
         if ((i == m_Sockets.end()) || (i->second->m_Status == SRTS_CLOSED))
         {
             HLOGC(smlog.Debug, log << "@" << u << "U::close: NOT AN ACTIVE SOCKET, returning.");
+            // The socket is already in the closed set - typically broken by
+            // the peer and swept there by the GC before the application
+            // called srt_close - but it may still be pinned to its
+            // multiplexer, which therefore cannot be disposed of yet. Unbind
+            // it now and re-check the muxer, like the active path below: an
+            // application that closes every socket of a multiplexer expects
+            // the muxer's worker threads to be gone once the last close
+            // returns (the srt_bind_virtual callback contract - the owner's
+            // transport object must be safe to destroy after that).
+            CMultiplexer* mux = tryUnbindClosedSocket(u);
+            if (mux && mux->tryCloseIfEmpty())
+            {
+                SRT_ASSERT(mux->empty());
+                checkRemoveMux(*mux);
+            }
             return SRT_STATUS_OK;
         }
         s = i->second;

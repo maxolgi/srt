@@ -878,7 +878,13 @@ typedef struct SRT_VirtualTransportConfig_
 // address to the send callback. Rendezvous sockets are not supported.
 // @cfg must have all three callbacks set and initial_rtt_ms in 0..30000
 // (SRT_EINVPARAM otherwise). A socket can be bound
-// only once, like with srt_bind(). In builds without
+// only once, like with srt_bind(). The callbacks may be invoked from SRT's
+// internal threads for as long as any socket of the dedicated multiplexer
+// (the bound socket and everything accepted from it) is open; once the
+// LAST of them has been closed - whatever broke the others first - no
+// thread invokes them anymore, so the resources the callbacks use (and,
+// with the srttransport helper, the queue object itself) are safe to
+// release after the final srt_close() returns. In builds without
 // ENABLE_VIRTUAL_TRANSPORT this function always fails with SRT_EINVOP
 // ("Operation not supported", the "not supported" error code; the old
 // experimental branch documented SRT_EINVPARAM, but the feature being
