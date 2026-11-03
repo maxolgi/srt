@@ -112,6 +112,11 @@ public:
 
     virtual bool isVirtual() const { return false; }
 
+    /// Get the virtual transport configuration of the channel, if it is
+    /// a virtual transport one. Returns NULL for channels that carry no
+    /// virtual transport configuration (the base class and CChannelUDP).
+    virtual const SRT_VirtualTransportConfig* vtconfig() const { return NULL; }
+
     virtual void setConfig(const CSrtMuxerConfig& config) = 0;
 
     /// Get the IP TTL.
@@ -366,6 +371,8 @@ public:
     const sockaddr_any& bindAddressAny();
 
     bool isVirtual() const { return true; }
+
+    const SRT_VirtualTransportConfig* vtconfig() const { return &m_VTConfig; }
 
 private:
     SRT_VirtualTransportConfig m_VTConfig; // Copied by value in the constructor.

@@ -3771,9 +3771,30 @@ void CUDT::startConnect(const sockaddr_any& serv_addr, int32_t forced_isn)
     if (m_config.iCryptoMode == CSrtConfig::CIPHER_MODE_AUTO)
         m_config.iCryptoMode = CSrtConfig::CIPHER_MODE_AES_CTR;
 
+    // Virtual transport configuration of this socket's multiplexer channel;
+    // NULL for a stock UDP channel, on which skip_induction cannot apply.
+    const SRT_VirtualTransportConfig* vt = m_pMuxer ? m_pMuxer->channel()->vtconfig() : NULL;
+
     // This is my current configuration
     if (m_config.bRendezvous)
     {
+        // The conclusion-first handshake of skip_induction relies on the
+        // caller-listener layout. Note that srt_bind_virtual() rejects a
+        // socket that has rendezvous already set; this covers the reverse
+        // order, when SRTO_RENDEZVOUS is set after srt_bind_virtual().
+        if (vt && vt->skip_induction)
+        {
+            LOGC(aclog.Error,
+                 log << CONID() << "startConnect: skip_induction is not supported in rendezvous mode.");
+            // The connector has been registered above, but this socket never
+            // reaches the connecting state (m_State is set to SSS_CONNECTING
+            // only past the first handshake send), so the connector-cleanup
+            // paths will not remove the entry. Undo the registration here;
+            // an entry abandoned this way would stay until its TTL expires.
+            m_pMuxer->removeConnector(m_SocketID);
+            throw CUDTException(MJ_NOTSUP, MN_INVAL, 0);
+        }
+
         // For rendezvous, use version 5 in the waveahand and the cookie.
         // In case when you get the version 4 waveahand, simply switch to
         // the legacy HSv4 rendezvous and this time send version 4 CONCLUSION.
@@ -3812,6 +3833,36 @@ void CUDT::startConnect(const sockaddr_any& serv_addr, int32_t forced_isn)
         m_ConnReq.m_iReqType = URQ_INDUCTION;
         m_ConnReq.m_iCookie  = 0;
         m_RdvState           = CHandShake::RDV_INVALID;
+    }
+
+    // SKIP-INDUCTION mode: the caller skips the INDUCTION phase and sends
+    // the CONCLUSION handshake immediately, with cookie 0 (there is no
+    // INDUCTION response to take a cookie from; the peer authentication
+    // that the cookie exchange provides is covered by the enclosing virtual
+    // transport). The HSv5 handshake state that a stock caller normally
+    // sets up when processing the INDUCTION response (see
+    // processConnectResponse) must be prepared here upfront because the
+    // first handshake being sent is already the CONCLUSION with the
+    // HSREQ/KMREQ extension blocks.
+    if (vt && vt->skip_induction)
+    {
+        m_ConnReq.m_iVersion      = HS_VERSION_SRT1;
+        m_ConnReq.m_iReqType      = URQ_CONCLUSION;
+        m_ConnReq.m_iType         = 0;
+        m_ConnReq.m_extensionType = SRT_CMD_HSREQ;
+
+        // For HSv5, the caller is INITIATOR and the listener is RESPONDER.
+        m_SrtHsSide = HSD_INITIATOR;
+
+        if (!createCrypter(HSD_INITIATOR))
+        {
+            m_RejectReason = SRT_REJ_RESOURCE;
+            // Same as on the refusal above: this throws before the socket
+            // reaches the connecting state, so the registered connector
+            // must be removed here.
+            m_pMuxer->removeConnector(m_SocketID);
+            throw CUDTException(MJ_SETUP, MN_REJECTED, 0);
+        }
     }
 
     m_ConnReq.m_iMSS            = m_config.iMSS;
@@ -3859,6 +3910,23 @@ void CUDT::startConnect(const sockaddr_any& serv_addr, int32_t forced_isn)
     // to the size of the allocated buffer, which not
     // necessarily is to be the size of the data.
     reqpkt.setLength(hs_size);
+
+    if (vt && vt->skip_induction)
+    {
+        // In SKIP-INDUCTION mode the first packet is the CONCLUSION, so it
+        // must be serialized with the HSv5 HSREQ/KMREQ extension blocks,
+        // exactly as the CONCLUSION sent by a stock caller after having
+        // processed the INDUCTION response.
+        if (!createSrtHandshake(SRT_CMD_HSREQ, SRT_CMD_KMREQ, 0, 0, (reqpkt), (m_ConnReq)))
+        {
+            LOGC(cnlog.Warn, log << CONID() << "startConnect: createSrtHandshake failed - REJECTING.");
+            // Same as on the refusal above: this throws before the socket
+            // reaches the connecting state, so the registered connector
+            // must be removed here.
+            m_pMuxer->removeConnector(m_SocketID);
+            throw CUDTException(MJ_SETUP, MN_REJECTED, 0);
+        }
+    }
 
     const steady_clock::time_point tnow = steady_clock::now();
     m_SndLastAck2Time = tnow;
@@ -12314,7 +12382,24 @@ int CUDT::processConnectRequest(const sockaddr_any& addr, CPacket& packet)
     HLOGC(cnlog.Debug,
           log << CONID() << "processConnectRequest: received type=" << RequestTypeStr(hs.m_iReqType)
               << " - checking cookie...");
-    if (hs.m_iCookie != cookie_val)
+
+    // SKIP-INDUCTION mode: a conclusion-first request arrives straight from
+    // a skip-induction caller, so there was no INDUCTION response that would
+    // hand a cookie over to the caller and the cookie check cannot apply
+    // (the cookie field carries 0). The DoS protection that the cookie
+    // exchange provides is covered by the enclosing virtual transport. The
+    // bypass applies only to a CONCLUSION request of at least HSv5 - the
+    // form a conclusion-first handshake takes; every other request,
+    // including a stock CONCLUSION with a cookie obtained through a normal
+    // INDUCTION round-trip, keeps the stock cookie validation below.
+    const SRT_VirtualTransportConfig* vt = m_pMuxer ? m_pMuxer->channel()->vtconfig() : NULL;
+    if (vt && vt->skip_induction
+            && hs.m_iReqType == URQ_CONCLUSION && hs.m_iVersion >= HS_VERSION_SRT1)
+    {
+        HLOGC(cnlog.Debug,
+              log << CONID() << "processConnectRequest: SKIP-INDUCTION mode - cookie check bypassed.");
+    }
+    else if (hs.m_iCookie != cookie_val)
     {
         cookie_val = bake(addr, cookie_val, -1); // SHOULD generate an earlier, distracted cookie
 
