@@ -1279,7 +1279,8 @@ SRTSTATUS CUDTUnited::bind(CUDTSocket* s, SYSSOCKET udpsock)
     return SRT_STATUS_OK;
 }
 
-SRTSTATUS CUDTUnited::bind_virtual(CUDTSocket* s, const sockaddr_any& name, const SRT_VirtualTransportConfig* vtcfg)
+SRTSTATUS CUDTUnited::bind_virtual(CUDTSocket* s, const sockaddr_any& name, const SRT_VirtualTransportConfig* vtcfg,
+        bool conclusion_first)
 {
     ScopedLock cg(s->m_ControlLock);
 
@@ -1298,25 +1299,22 @@ SRTSTATUS CUDTUnited::bind_virtual(CUDTSocket* s, const sockaddr_any& name, cons
     if (vtcfg->initial_rtt_ms < 0 || vtcfg->initial_rtt_ms > 30000)
         throw CUDTException(MJ_NOTSUP, MN_INVAL, 0);
 
-    if (vtcfg->skip_induction != 0 && vtcfg->skip_induction != 1)
-        throw CUDTException(MJ_NOTSUP, MN_INVAL, 0);
-
     // Rendezvous over a virtual transport is not supported.
     if (s->core().m_config.bRendezvous)
         throw CUDTException(MJ_NOTSUP, MN_ISRENDEZVOUS, 0);
 
-    bindSocketToMuxer(s, name, NULL, vtcfg);
+    bindSocketToMuxer(s, name, NULL, vtcfg, conclusion_first);
     return SRT_STATUS_OK;
 }
 
 void CUDTUnited::bindSocketToMuxer(CUDTSocket* s, const sockaddr_any& address, SYSSOCKET* psocket,
-        const SRT_VirtualTransportConfig* vtcfg)
+        const SRT_VirtualTransportConfig* vtcfg, bool conclusion_first)
 {
     if (address.hport() == 0 && s->core().m_config.bRendezvous)
         throw CUDTException(MJ_NOTSUP, MN_ISRENDUNBOUND, 0);
 
     s->core().open();
-    updateMux(s, address, psocket, vtcfg);
+    updateMux(s, address, psocket, vtcfg, conclusion_first);
     // -> C(Snd|Rcv)Queue::init
     // -> pthread_create(...C(Snd|Rcv)Queue::worker...)
     s->m_Status = SRTS_OPENED;
@@ -4022,7 +4020,7 @@ bool CUDTUnited::channelSettingsMatch(const CSrtMuxerConfig& cfgMuxer, const CSr
 }
 
 void CUDTUnited::updateMux(CUDTSocket* s, const sockaddr_any& reqaddr, const SYSSOCKET* udpsock /*[[nullable]]*/,
-        const SRT_VirtualTransportConfig* vtcfg /*[[nullable]]*/)
+        const SRT_VirtualTransportConfig* vtcfg /*[[nullable]]*/, bool conclusion_first)
 {
     ExclusiveLock cg(m_GlobControlLock);
 
@@ -4066,7 +4064,7 @@ void CUDTUnited::updateMux(CUDTSocket* s, const sockaddr_any& reqaddr, const SYS
             throw CUDTException(MJ_NOTSUP, MN_ISBOUND);
         }
         CMultiplexer& m = is.first;
-        m.configure(int32_t(s->id()), s->core().m_config, reqaddr, udpsock, vtcfg);
+        m.configure(int32_t(s->id()), s->core().m_config, reqaddr, udpsock, vtcfg, conclusion_first);
         installMuxer((s), (&m));
     }
     catch (const CUDTException& x)
@@ -4675,7 +4673,8 @@ SRTSTATUS CUDT::bind(SRTSOCKET u, SYSSOCKET udpsock)
     }
 }
 
-SRTSTATUS CUDT::bind_virtual(SRTSOCKET u, const sockaddr* name, int namelen, const SRT_VirtualTransportConfig* vtcfg)
+SRTSTATUS CUDT::bind_virtual(SRTSOCKET u, const sockaddr* name, int namelen, const SRT_VirtualTransportConfig* vtcfg,
+        bool conclusion_first)
 {
     try
     {
@@ -4687,6 +4686,7 @@ SRTSTATUS CUDT::bind_virtual(SRTSOCKET u, const sockaddr* name, int namelen, con
         (void)name;
         (void)namelen;
         (void)vtcfg;
+        (void)conclusion_first;
         return APIError(MJ_NOTSUP, MN_NONE, 0); // SRT_EINVOP
 #else
         sockaddr_any sa(name, namelen);
@@ -4702,7 +4702,7 @@ SRTSTATUS CUDT::bind_virtual(SRTSOCKET u, const sockaddr* name, int namelen, con
         if (!s)
             return APIError(MJ_NOTSUP, MN_INVAL, 0);
 
-        return uglobal().bind_virtual(s, sa, vtcfg);
+        return uglobal().bind_virtual(s, sa, vtcfg, conclusion_first);
 #endif
     }
     catch (const CUDTException& e)

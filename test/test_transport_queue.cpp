@@ -512,9 +512,8 @@ TEST(TransportQueue, GetConfigWiring)
     SendCapture cap;
     SRTTransportQueue q(&captureSend, &cap);
 
-    const SRT_VirtualTransportConfig cfg = q.getConfig(2500, 1);
+    const SRT_VirtualTransportConfig cfg = q.getConfig(2500);
     EXPECT_EQ(cfg.initial_rtt_ms, 2500);
-    EXPECT_EQ(cfg.skip_induction, 1);
     EXPECT_EQ(cfg.opaq, &q);
     ASSERT_NE(cfg.send, nullptr);
     ASSERT_NE(cfg.waitread, nullptr);

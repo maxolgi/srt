@@ -30,8 +30,7 @@ int MySend(void* opaq, const char* data, int len,
 // 2. Create the queue around the callback, and bind a socket with its config.
 srt::SRTTransportQueue queue(&MySend, &medium);
 SRTSOCKET sock = srt_create_socket();
-SRT_VirtualTransportConfig cfg = queue.getConfig(/*initial_rtt_ms=*/0,
-                                                 /*skip_induction=*/1);
+SRT_VirtualTransportConfig cfg = queue.getConfig(/*initial_rtt_ms=*/0);
 sockaddr_in label = ...;                    // only a label, nothing OS-bound
 srt_bind_virtual(sock, (sockaddr*)&label, sizeof label, &cfg);
 srt_listen(sock, 5);                        // or srt_connect(sock, ...)

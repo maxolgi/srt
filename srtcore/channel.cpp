@@ -1246,12 +1246,14 @@ Return_error:
     return status;
 }
 
-CChannelVirtual::CChannelVirtual(const SRT_VirtualTransportConfig& cfg, const sockaddr_any& label)
+CChannelVirtual::CChannelVirtual(const SRT_VirtualTransportConfig& cfg, const sockaddr_any& label, bool conclusion_first)
     : m_VTConfig(cfg)
     , m_Label(label)
+    , m_bConclusionFirst(conclusion_first)
     , m_bBroken(false)
 {
-    LOGC(kmlog.Debug, log << "CHANNEL: VIRTUAL transport opened, local address: " << m_Label.str());
+    LOGC(kmlog.Debug, log << "CHANNEL: VIRTUAL transport opened, local address: " << m_Label.str()
+                          << (conclusion_first ? ", conclusion-first handshake" : ""));
 }
 
 void CChannelVirtual::close()

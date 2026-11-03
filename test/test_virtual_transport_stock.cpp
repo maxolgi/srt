@@ -69,7 +69,6 @@ SRT_VirtualTransportConfig GoodConfig()
     cfg.deliver        = &UnusedDeliverFunc;
     cfg.opaq           = NULL;
     cfg.initial_rtt_ms = 0;
-    cfg.skip_induction = 0;
     return cfg;
 }
 

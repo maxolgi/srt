@@ -111,12 +111,15 @@ public:
 
     /// @brief Get the config wiring the seam callbacks to this object.
     ///
+    /// The returned config models the PUBLIC virtual transport
+    /// configuration; it does not set the handshake form - the
+    /// conclusion-first form is an internal srtcore setting, not part of
+    /// the public API.
+    ///
     /// @param [in] initial_rtt_ms initial RTT to assume for the connection
     /// (0 = disabled, otherwise 1..30000).
-    /// @param [in] skip_induction 0/1: skip the induction phase of the
-    /// handshake.
     /// @return The config to pass to srt_bind_virtual().
-    SRT_VirtualTransportConfig getConfig(int initial_rtt_ms = 0, int skip_induction = 0);
+    SRT_VirtualTransportConfig getConfig(int initial_rtt_ms = 0);
 
     /// @brief Gather an outgoing datagram and hand it to the send callback.
     ///

@@ -117,6 +117,13 @@ public:
     /// virtual transport configuration (the base class and CChannelUDP).
     virtual const SRT_VirtualTransportConfig* vtconfig() const { return NULL; }
 
+    /// Query whether the channel runs the conclusion-first handshake
+    /// form (the internal skip-induction setting of a virtual transport
+    /// channel, entered only through the internal C++ bind path - never
+    /// through the public API). Every channel that has it not set
+    /// returns false, structurally including the UDP channel.
+    virtual bool conclusionFirst() const { return false; }
+
     virtual void setConfig(const CSrtMuxerConfig& config) = 0;
 
     /// Get the IP TTL.
@@ -348,8 +355,11 @@ public:
     /// @param [in] cfg callbacks and settings of the virtual transport,
     /// copied by value.
     /// @param [in] label The local address that the channel reports.
+    /// @param [in] conclusion_first Run the handshake in the
+    /// conclusion-first form (the internal skip-induction setting; see
+    /// CChannel::conclusionFirst()).
 
-    CChannelVirtual(const SRT_VirtualTransportConfig& cfg, const sockaddr_any& label);
+    CChannelVirtual(const SRT_VirtualTransportConfig& cfg, const sockaddr_any& label, bool conclusion_first);
 
     void close();
     void stop();
@@ -374,9 +384,12 @@ public:
 
     const SRT_VirtualTransportConfig* vtconfig() const { return &m_VTConfig; }
 
+    bool conclusionFirst() const { return m_bConclusionFirst; }
+
 private:
     SRT_VirtualTransportConfig m_VTConfig; // Copied by value in the constructor.
     sockaddr_any m_Label; // The local address reported by getSockAddr().
+    bool m_bConclusionFirst; // The handshake form, from the internal bind path.
 
     // Set by close()/stop() from a thread other than the receive worker,
     // and when the medium reports itself broken; makes recvfrom() return

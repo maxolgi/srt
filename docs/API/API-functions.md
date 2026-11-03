@@ -598,7 +598,7 @@ provided address buffer. The callback must return the total number of bytes
 written, or -1 on error - the datagram is then discarded and SRT reads on, like
 after a temporary `recvmsg()` error.
 
-Two settings in `cfg` configure the connection itself:
+One setting in `cfg` configures the connection itself:
 
 * `initial_rtt_ms`: the initial round trip time to assume, in milliseconds
 (0 = disabled, otherwise 1..30000). When disabled, the stock behavior applies,
@@ -610,11 +610,10 @@ reused across unrelated sessions, so a cache hit could apply the RTT of an
 unrelated session. The seed holds until the first live RTT sample replaces it
 the usual way.
 
-* `skip_induction`: 0 or 1. When 1, the Induction phase of the handshake is
-skipped and the caller's opening flight is conclusion-first, which removes the
-round trip that normally delivers the first RTT sample (a nonzero
-`initial_rtt_ms` usually accompanies it). This works only over a virtual
-transport; a rendezvous socket is rejected by `srt_bind_virtual` altogether.
+The handshake form is not configurable through this API: `srt_bind_virtual`
+always runs the stock handshake. (The conclusion-first form - the caller
+opening with the CONCLUSION handshake and no cookie exchange - exists as an
+internal srtcore integration setting, not reachable by any API call.)
 
 The multiplexer of a virtual binding is dedicated to the one socket that made
 the bind call - unlike with [`srt_bind`](#srt_bind), it is never shared with
@@ -636,7 +635,7 @@ together with the feature and is not part of `libsrt`; see
 
 |       Errors                             |                                                                      |
 |:---------------------------------------- |:-------------------------------------------------------------------- |
-| [`SRT_EINVPARAM`](#srt_einvparam)        | Invalid `name`/`namelen`, invalid or closed [`u`](#u), or invalid `cfg`: NULL config, <br/> a missing callback, `initial_rtt_ms` outside 0..30000, `skip_induction` other than 0/1 |
+| [`SRT_EINVPARAM`](#srt_einvparam)        | Invalid `name`/`namelen`, invalid or closed [`u`](#u), or invalid `cfg`: NULL config, <br/> a missing callback, `initial_rtt_ms` outside 0..30000 |
 | [`SRT_EINVOP`](#srt_einvop)              | The build has no virtual transport support (every call fails with it), <br/> or the socket is already bound or listening (a socket can be bound only once, as with [`srt_bind`](#srt_bind)) |
 | [`SRT_ERDVNOSERV`](#srt_erdvnoserv)      | [`SRTO_RENDEZVOUS`](API-socket-options.md#SRTO_RENDEZVOUS) flag is set to true on specified socket |
 | <img width=240px height=1px/>            | <img width=710px height=1px/>                                        |

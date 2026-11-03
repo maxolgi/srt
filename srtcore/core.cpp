@@ -3771,21 +3771,23 @@ void CUDT::startConnect(const sockaddr_any& serv_addr, int32_t forced_isn)
     if (m_config.iCryptoMode == CSrtConfig::CIPHER_MODE_AUTO)
         m_config.iCryptoMode = CSrtConfig::CIPHER_MODE_AES_CTR;
 
-    // Virtual transport configuration of this socket's multiplexer channel;
-    // NULL for a stock UDP channel, on which skip_induction cannot apply.
-    const SRT_VirtualTransportConfig* vt = m_pMuxer ? m_pMuxer->channel()->vtconfig() : NULL;
+    // The conclusion-first handshake form is a property of this socket's
+    // multiplexer channel, entered only through the internal
+    // configuration path of bind_virtual; a stock UDP channel reports
+    // it structurally false.
+    const bool concl = m_pMuxer && m_pMuxer->channel()->conclusionFirst();
 
     // This is my current configuration
     if (m_config.bRendezvous)
     {
-        // The conclusion-first handshake of skip_induction relies on the
-        // caller-listener layout. Note that srt_bind_virtual() rejects a
+        // The conclusion-first handshake relies on the caller-listener
+        // layout. Note that srt_bind_virtual() rejects a
         // socket that has rendezvous already set; this covers the reverse
         // order, when SRTO_RENDEZVOUS is set after srt_bind_virtual().
-        if (vt && vt->skip_induction)
+        if (concl)
         {
             LOGC(aclog.Error,
-                 log << CONID() << "startConnect: skip_induction is not supported in rendezvous mode.");
+                 log << CONID() << "startConnect: the conclusion-first handshake is not supported in rendezvous mode.");
             // The connector has been registered above, but this socket never
             // reaches the connecting state (m_State is set to SSS_CONNECTING
             // only past the first handshake send), so the connector-cleanup
@@ -3844,7 +3846,7 @@ void CUDT::startConnect(const sockaddr_any& serv_addr, int32_t forced_isn)
     // processConnectResponse) must be prepared here upfront because the
     // first handshake being sent is already the CONCLUSION with the
     // HSREQ/KMREQ extension blocks.
-    if (vt && vt->skip_induction)
+    if (concl)
     {
         m_ConnReq.m_iVersion      = HS_VERSION_SRT1;
         m_ConnReq.m_iReqType      = URQ_CONCLUSION;
@@ -3911,7 +3913,7 @@ void CUDT::startConnect(const sockaddr_any& serv_addr, int32_t forced_isn)
     // necessarily is to be the size of the data.
     reqpkt.setLength(hs_size);
 
-    if (vt && vt->skip_induction)
+    if (concl)
     {
         // In SKIP-INDUCTION mode the first packet is the CONCLUSION, so it
         // must be serialized with the HSv5 HSREQ/KMREQ extension blocks,
@@ -12428,9 +12430,8 @@ int CUDT::processConnectRequest(const sockaddr_any& addr, CPacket& packet)
     // form a conclusion-first handshake takes; every other request,
     // including a stock CONCLUSION with a cookie obtained through a normal
     // INDUCTION round-trip, keeps the stock cookie validation below.
-    const SRT_VirtualTransportConfig* vt = m_pMuxer ? m_pMuxer->channel()->vtconfig() : NULL;
-    if (vt && vt->skip_induction
-            && hs.m_iReqType == URQ_CONCLUSION && hs.m_iVersion >= HS_VERSION_SRT1)
+    const bool concl = m_pMuxer && m_pMuxer->channel()->conclusionFirst();
+    if (concl && hs.m_iReqType == URQ_CONCLUSION && hs.m_iVersion >= HS_VERSION_SRT1)
     {
         HLOGC(cnlog.Debug,
               log << CONID() << "processConnectRequest: SKIP-INDUCTION mode - cookie check bypassed.");

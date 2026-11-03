@@ -1180,7 +1180,7 @@ bool CMultiplexer::qualifyToHandleRID(EReadStatus    rst,
 }
 
 void CMultiplexer::configure(int32_t id, const CSrtConfig& config, const sockaddr_any& reqaddr, const SYSSOCKET* udpsock,
-        const SRT_VirtualTransportConfig* vtcfg)
+        const SRT_VirtualTransportConfig* vtcfg, bool conclusion_first)
 {
     m_mcfg = config;
     m_iID  = id;
@@ -1192,8 +1192,10 @@ void CMultiplexer::configure(int32_t id, const CSrtConfig& config, const sockadd
         // in the OS, so the channel reports the requested address as the
         // local one, exactly as given - unlike on the UDP path below, a
         // port 0 is not autoselected by the system and stays 0. There is
-        // also no IPV6_V6ONLY sockopt to query.
-        m_pChannel = new CChannelVirtual(*vtcfg, reqaddr);
+        // also no IPV6_V6ONLY sockopt to query. The conclusion_first flag
+        // (the internal skip-induction setting) becomes a property of the
+        // channel, the only place the handshake form is read from.
+        m_pChannel = new CChannelVirtual(*vtcfg, reqaddr, conclusion_first);
         m_pChannel->setConfig(m_mcfg);
         m_SelfAddr = m_pChannel->getSockAddr();
     }

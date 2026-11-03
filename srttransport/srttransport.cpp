@@ -103,7 +103,7 @@ void SRTTransportQueue::detach()
     m_WakeCV.notify_all();
 }
 
-SRT_VirtualTransportConfig SRTTransportQueue::getConfig(int initial_rtt_ms, int skip_induction)
+SRT_VirtualTransportConfig SRTTransportQueue::getConfig(int initial_rtt_ms)
 {
     SRT_VirtualTransportConfig cfg;
     cfg.send           = &SRTTransportQueue::stubSend;
@@ -111,7 +111,6 @@ SRT_VirtualTransportConfig SRTTransportQueue::getConfig(int initial_rtt_ms, int 
     cfg.deliver        = &SRTTransportQueue::stubDeliver;
     cfg.opaq           = this;
     cfg.initial_rtt_ms = initial_rtt_ms;
-    cfg.skip_induction = skip_induction;
     return cfg;
 }
 

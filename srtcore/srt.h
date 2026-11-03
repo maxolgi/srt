@@ -866,7 +866,6 @@ typedef struct SRT_VirtualTransportConfig_
     SRT_VirtualTransportDeliverFunc*  deliver;        // picks up one incoming datagram
     void*                             opaq;           // opaque value passed through to every callback
     int                               initial_rtt_ms; // initial RTT to assume (0 = disabled, otherwise 1..30000)
-    int                               skip_induction; // 0/1: skip the induction phase of the handshake
 } SRT_VirtualTransportConfig;
 
 // Bind a socket to a virtual transport, instead of an OS UDP socket. Like
@@ -877,8 +876,8 @@ typedef struct SRT_VirtualTransportConfig_
 // nothing is bound in the OS, srt_getsockname() reports it exactly as given
 // (a port 0 is not autoselected and stays 0), and it is passed as the source
 // address to the send callback. Rendezvous sockets are not supported.
-// @cfg must have all three callbacks set, initial_rtt_ms in 0..30000 and
-// skip_induction 0 or 1 (SRT_EINVPARAM otherwise). A socket can be bound
+// @cfg must have all three callbacks set and initial_rtt_ms in 0..30000
+// (SRT_EINVPARAM otherwise). A socket can be bound
 // only once, like with srt_bind(). In builds without
 // ENABLE_VIRTUAL_TRANSPORT this function always fails with SRT_EINVOP
 // ("Operation not supported", the "not supported" error code; the old

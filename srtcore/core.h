@@ -317,7 +317,11 @@ public: //API
 #endif
     static SRTSTATUS bind(SRTSOCKET u, const sockaddr* name, int namelen);
     static SRTSTATUS bind(SRTSOCKET u, SYSSOCKET udpsock);
-    static SRTSTATUS bind_virtual(SRTSOCKET u, const sockaddr* name, int namelen, const SRT_VirtualTransportConfig* vtcfg);
+    // The conclusion_first parameter is the INTERNAL configuration path
+    // for the conclusion-first (skip-induction) handshake form - it is
+    // deliberately not exposed through any public API call; the public
+    // srt_bind_virtual always binds with the stock handshake form.
+    static SRTSTATUS bind_virtual(SRTSOCKET u, const sockaddr* name, int namelen, const SRT_VirtualTransportConfig* vtcfg, bool conclusion_first = false);
     static SRTSTATUS listen(SRTSOCKET u, int backlog);
     static SRTSOCKET accept(SRTSOCKET u, sockaddr* addr, int* addrlen);
     static SRTSOCKET accept_bond(const SRTSOCKET listeners [], int lsize, int64_t msTimeOut);

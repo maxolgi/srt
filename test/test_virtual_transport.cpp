@@ -30,7 +30,7 @@
 #include "srt.h"
 #include "srttransport.h"
 
-#include "core.h" // CHandShake, CPacket: the wire-level handshake pins
+#include "core.h" // CHandShake, CPacket: the wire-level handshake pins; CUDT: the internal bind entry
 
 namespace
 {
@@ -280,6 +280,18 @@ void ExpectSockName(SRTSOCKET sock, const sockaddr_in& expect)
     EXPECT_EQ(self.sin_addr.s_addr, expect.sin_addr.s_addr);
 }
 
+// Binds a socket over a virtual transport in the conclusion-first
+// handshake form. The form is an INTERNAL srtcore setting, deliberately
+// not reachable through the public API - the public srt_bind_virtual
+// always binds with the stock handshake form - so the in-tree tests
+// enter it through the internal C++ configuration path, exactly like the
+// other in-tree components that need it.
+void BindVirtualConclusionFirst(SRTSOCKET sock, const sockaddr_in& label, const SRT_VirtualTransportConfig& cfg)
+{
+    ASSERT_EQ(srt::CUDT::bind_virtual(sock, (const sockaddr*)&label, (int)sizeof label, &cfg, true), SRT_STATUS_OK)
+        << srt_getlasterror_str();
+}
+
 } // namespace
 
 class TestVirtualTransport : public srt::Test
@@ -394,8 +406,8 @@ TEST_F(TestVirtualTransport, BindVirtualConnectListenSendReceive)
     ExpectSockName(m_accepted_sock, listener_addr);
 
     // The wire-level pin on the caller's opening flight: with the stock
-    // handshake (no skip_induction in the config), the first datagram is
-    // the Induction handshake.
+    // handshake form (what the public bind configures), the first datagram
+    // is the Induction handshake.
     ExpectFirstHandshake(m_caller_wire, srt::URQ_INDUCTION);
 
     // One payload message from the caller to the accepted socket. Use
@@ -445,8 +457,8 @@ TEST_F(TestVirtualTransport, BindVirtualConnectListenSendReceive)
 
 // The config gate of srt_bind_virtual: the whole transport must be usable
 // as given, because there are no virtual-transport socket options to fix
-// anything up later. A NULL config, a missing callback, an out-of-range
-// initial_rtt_ms and a skip_induction other than 0/1 are all rejected
+// anything up later. A NULL config, a missing callback and an out-of-range
+// initial_rtt_ms are all rejected
 // with SRT_EINVPARAM, as is a call on an invalid or closed socket or with
 // a namelen too small for the address family. The boundary values of
 // initial_rtt_ms (0 and 30000) are accepted, and every refusal leaves the
@@ -511,16 +523,6 @@ TEST_F(TestVirtualTransport, BindVirtualBadConfigRejected)
         ExpectLastErrno(SRT_EINVPARAM);
     }
 
-    // skip_induction other than 0/1.
-    {
-        SRT_VirtualTransportConfig cfg = good;
-        cfg.skip_induction = 2;
-        EXPECT_EQ(srt_bind_virtual(m_listener_sock, (const sockaddr*)&self_addr, (int)sizeof self_addr, &cfg),
-                  SRT_ERROR)
-            << "skip_induction = 2 was not rejected";
-        ExpectLastErrno(SRT_EINVPARAM);
-    }
-
     // A namelen too small for the family, and a family no socket can be
     // bound with: in both cases there is no address to bind to.
     {
@@ -544,7 +546,7 @@ TEST_F(TestVirtualTransport, BindVirtualBadConfigRejected)
     // The boundary values of initial_rtt_ms are accepted (each on its own
     // fresh socket - a socket can be bound only once).
     {
-        const SRT_VirtualTransportConfig cfg0  = m_listener_queue.getConfig(0, 0);
+        const SRT_VirtualTransportConfig cfg0  = m_listener_queue.getConfig(0);
         const sockaddr_in                addr0 = FillV4("10.211.0.3", 5555);
         m_caller_sock                      = srt_create_socket();
         ASSERT_NE(m_caller_sock, SRT_INVALID_SOCK);
@@ -555,7 +557,7 @@ TEST_F(TestVirtualTransport, BindVirtualBadConfigRejected)
         m_caller_sock = SRT_INVALID_SOCK;
     }
     {
-        const SRT_VirtualTransportConfig cfg_max = m_listener_queue.getConfig(30000, 1);
+        const SRT_VirtualTransportConfig cfg_max = m_listener_queue.getConfig(30000);
         const sockaddr_in                addr9   = FillV4("10.211.0.4", 5555);
         m_accepted_sock                    = srt_create_socket();
         ASSERT_NE(m_accepted_sock, SRT_INVALID_SOCK);
@@ -657,16 +659,17 @@ TEST_F(TestVirtualTransport, BindVirtualDoubleBindRejected)
     m_listener_sock = SRT_INVALID_SOCK;
 }
 
-// The same wire as in BindVirtualConnectListenSendReceive, but with
-// skip_induction=1 in the configs of BOTH endpoints: the caller's opening
-// flight is the CONCLUSION handshake - HS_VERSION_SRT1, cookie 0, carrying
-// the HSv5 extension blocks - and the listener's multiplexer accepts it
-// without the Induction/cookie exchange. The wire-level pins make the
-// option's defining behavior falsifiable: a virtual listener would complete
-// a session against a stock caller too (it answers Inductions), so the
-// conclusion-first shape is only observable in the caller's very first
-// datagram. Proves the skip-induction path leaves the connected state and
-// the bidirectional data flow intact.
+// The same wire as in BindVirtualConnectListenSendReceive, but with BOTH
+// endpoints bound through the INTERNAL conclusion-first configuration
+// (the skip-induction form, not reachable through the public API): the
+// caller's opening flight is the CONCLUSION handshake - HS_VERSION_SRT1,
+// cookie 0, carrying the HSv5 extension blocks - and the listener's
+// multiplexer accepts it without the Induction/cookie exchange. The
+// wire-level pins make the mode's defining behavior falsifiable: a virtual
+// listener would complete a session against a stock caller too (it answers
+// Inductions), so the conclusion-first shape is only observable in the
+// caller's very first datagram. Proves the skip-induction path leaves the
+// connected state and the bidirectional data flow intact.
 TEST_F(TestVirtualTransport, BindVirtualSkipInductionRoundTrip)
 {
     const sockaddr_in listener_addr = FillV4("10.215.0.2", 5555);
@@ -674,31 +677,21 @@ TEST_F(TestVirtualTransport, BindVirtualSkipInductionRoundTrip)
 
     PairWires(caller_addr, listener_addr);
 
-    // Listener side: the multiplexer config carries skip_induction, so its
-    // channel reports it and processConnectRequest bypasses the cookie
+    // Listener side: bound through the internal conclusion-first entry, so
+    // its channel reports it and processConnectRequest bypasses the cookie
     // check for a conclusion-first request.
     m_listener_sock = srt_create_socket();
     ASSERT_NE(m_listener_sock, SRT_INVALID_SOCK);
     m_listener_wire.sock = m_listener_sock;
-    {
-        const SRT_VirtualTransportConfig cfg = m_listener_queue.getConfig(0, 1);
-        ASSERT_EQ(srt_bind_virtual(m_listener_sock, (const sockaddr*)&listener_addr, (int)sizeof listener_addr, &cfg),
-                  SRT_STATUS_OK)
-            << srt_getlasterror_str();
-    }
+    BindVirtualConclusionFirst(m_listener_sock, listener_addr, m_listener_queue.getConfig());
     ASSERT_NE(srt_listen(m_listener_sock, 4), SRT_ERROR) << srt_getlasterror_str();
 
-    // Caller side: skip_induction in its multiplexer config turns the first
+    // Caller side: the internal conclusion-first bind turns the first
     // handshake into the CONCLUSION.
     m_caller_sock = srt_create_socket();
     ASSERT_NE(m_caller_sock, SRT_INVALID_SOCK);
     m_caller_wire.sock = m_caller_sock;
-    {
-        const SRT_VirtualTransportConfig cfg = m_caller_queue.getConfig(0, 1);
-        ASSERT_EQ(srt_bind_virtual(m_caller_sock, (const sockaddr*)&caller_addr, (int)sizeof caller_addr, &cfg),
-                  SRT_STATUS_OK)
-            << srt_getlasterror_str();
-    }
+    BindVirtualConclusionFirst(m_caller_sock, caller_addr, m_caller_queue.getConfig());
 
     ASSERT_NE(srt_connect(m_caller_sock, (const sockaddr*)&listener_addr, (int)sizeof listener_addr), SRT_ERROR)
         << srt_getlasterror_str();
@@ -764,16 +757,17 @@ TEST_F(TestVirtualTransport, BindVirtualSkipInductionRoundTrip)
     m_listener_sock = SRT_INVALID_SOCK;
 }
 
-// The per-multiplexer gate of skip_induction: the cookie bypass belongs to
-// the listener's OWN bind configuration, not to the medium. A listener
-// bound without skip_induction must keep the stock cookie validation even
-// against a conclusion-first request that arrived over a virtual
-// transport: a wrong cookie (0, as a skip caller sends) is silently
-// ignored, no connection may ever be queued on it, and the listener stays
-// in the listening state. The caller observes the refusal through its
-// bounded connect timeout. This pins that skip_induction is a contract
-// between the two endpoints' configs, not a global property of the
-// virtual transport seam.
+// The per-multiplexer gate of the conclusion-first form: the cookie bypass
+// belongs to the listener's OWN bind configuration, not to the medium. A
+// listener bound through the PUBLIC srt_bind_virtual (the stock handshake
+// form) must keep the stock cookie validation even against a
+// conclusion-first request that arrived over a virtual transport: a wrong
+// cookie (0, as a conclusion-first caller sends) is silently ignored, no
+// connection may ever be queued on it, and the listener stays in the
+// listening state. The caller observes the refusal through its bounded
+// connect timeout. This pins that the handshake form is a contract between
+// the two endpoints' configurations, not a global property of the virtual
+// transport seam.
 TEST_F(TestVirtualTransport, VirtualListenerWithoutSkipStillRequiresCookie)
 {
     const sockaddr_in listener_addr = FillV4("10.216.0.2", 5555);
@@ -781,7 +775,7 @@ TEST_F(TestVirtualTransport, VirtualListenerWithoutSkipStillRequiresCookie)
 
     PairWires(caller_addr, listener_addr);
 
-    // Listener side: the stock config - no skip_induction.
+    // Listener side: the PUBLIC bind - the stock handshake form.
     m_listener_sock = srt_create_socket();
     ASSERT_NE(m_listener_sock, SRT_INVALID_SOCK);
     m_listener_wire.sock = m_listener_sock;
@@ -793,29 +787,24 @@ TEST_F(TestVirtualTransport, VirtualListenerWithoutSkipStillRequiresCookie)
     }
     ASSERT_NE(srt_listen(m_listener_sock, 4), SRT_ERROR) << srt_getlasterror_str();
 
-    // Caller side: skip_induction, so its opening flight is a cookie-0
-    // CONCLUSION. The connect timeout bounds the refusal: the listener
-    // ignores every retransmission of the wrong-cookie request, so the
-    // caller can only run out of its connect timeout.
+    // Caller side: the INTERNAL conclusion-first bind, so its opening flight
+    // is a cookie-0 CONCLUSION. The connect timeout bounds the refusal: the
+    // listener ignores every retransmission of the wrong-cookie request, so
+    // the caller can only run out of its connect timeout.
     m_caller_sock = srt_create_socket();
     ASSERT_NE(m_caller_sock, SRT_INVALID_SOCK);
     m_caller_wire.sock = m_caller_sock;
     const int conn_timeout_ms = 500;
     ASSERT_NE(srt_setsockopt(m_caller_sock, 0, SRTO_CONNTIMEO, &conn_timeout_ms, sizeof conn_timeout_ms), SRT_ERROR)
         << srt_getlasterror_str();
-    {
-        const SRT_VirtualTransportConfig cfg = m_caller_queue.getConfig(0, 1);
-        ASSERT_EQ(srt_bind_virtual(m_caller_sock, (const sockaddr*)&caller_addr, (int)sizeof caller_addr, &cfg),
-                  SRT_STATUS_OK)
-            << srt_getlasterror_str();
-    }
+    BindVirtualConclusionFirst(m_caller_sock, caller_addr, m_caller_queue.getConfig());
 
     EXPECT_EQ(srt_connect(m_caller_sock, (const sockaddr*)&listener_addr, (int)sizeof listener_addr), SRT_ERROR);
     // The bounded refusal: the caller can only run out of its connect
     // timeout, the shape the wrong-cookie silence produces.
     ExpectLastErrno(SRT_ENOSERVER);
 
-    // The refusal was about the listener's missing skip config, not about
+    // The refusal was about the listener's stock handshake form, not about
     // the caller's opening flight: it was the conclusion-first shape.
     const int       hs_version_srt1 = srt::CUDT::HS_VERSION_SRT1;
     srt::CHandShake first_flight;
@@ -824,7 +813,7 @@ TEST_F(TestVirtualTransport, VirtualListenerWithoutSkipStillRequiresCookie)
     ASSERT_EQ(first_flight.m_iCookie, 0);
 
     // Nothing was ever queued on the listener, and it stays listening.
-    EXPECT_FALSE(WaitReadable(m_listener_sock, 500)) << "a connection was queued on the listener without skip_induction";
+    EXPECT_FALSE(WaitReadable(m_listener_sock, 500)) << "a connection was queued on the stock-form listener";
     EXPECT_EQ(srt_getsockstate(m_listener_sock), SRTS_LISTENING);
 
     // Both sockets close cleanly after the refused handshake.
@@ -862,16 +851,10 @@ TEST_F(TestVirtualTransport, InitialRTTSeedViaConfigThenLiveReplace)
     m_listener_sock = srt_create_socket();
     ASSERT_NE(m_listener_sock, SRT_INVALID_SOCK);
     m_listener_wire.sock = m_listener_sock;
-    {
-        // Both endpoints skip the Induction round trip (the phase that
-        // normally delivers the first RTT sample) and seed the estimator
-        // explicitly, as a WebTransport gateway does with the QUIC
-        // smoothed RTT.
-        const SRT_VirtualTransportConfig cfg = m_listener_queue.getConfig(seed_rtt_ms, 1);
-        ASSERT_EQ(srt_bind_virtual(m_listener_sock, (const sockaddr*)&listener_addr, (int)sizeof listener_addr, &cfg),
-                  SRT_STATUS_OK)
-            << srt_getlasterror_str();
-    }
+    // Both endpoints skip the Induction round trip (bound conclusion-first
+    // through the internal entry) and seed the estimator explicitly, as a
+    // WebTransport gateway does with the QUIC smoothed RTT.
+    BindVirtualConclusionFirst(m_listener_sock, listener_addr, m_listener_queue.getConfig(seed_rtt_ms));
     ASSERT_NE(srt_listen(m_listener_sock, 4), SRT_ERROR) << srt_getlasterror_str();
 
     m_caller_sock = srt_create_socket();
@@ -879,12 +862,7 @@ TEST_F(TestVirtualTransport, InitialRTTSeedViaConfigThenLiveReplace)
     m_caller_wire.sock = m_caller_sock;
     ASSERT_NE(srt_setsockopt(m_caller_sock, 0, SRTO_RCVTIMEO, &rcv_timeout_ms, sizeof rcv_timeout_ms), SRT_ERROR)
         << srt_getlasterror_str();
-    {
-        const SRT_VirtualTransportConfig cfg = m_caller_queue.getConfig(seed_rtt_ms, 1);
-        ASSERT_EQ(srt_bind_virtual(m_caller_sock, (const sockaddr*)&caller_addr, (int)sizeof caller_addr, &cfg),
-                  SRT_STATUS_OK)
-            << srt_getlasterror_str();
-    }
+    BindVirtualConclusionFirst(m_caller_sock, caller_addr, m_caller_queue.getConfig(seed_rtt_ms));
 
     ASSERT_NE(srt_connect(m_caller_sock, (const sockaddr*)&listener_addr, (int)sizeof listener_addr), SRT_ERROR)
         << srt_getlasterror_str();
@@ -953,22 +931,12 @@ TEST_F(TestVirtualTransport, InitialRTTSeedViaConfigThenLiveReplace)
 
     m_listener_sock = srt_create_socket();
     ASSERT_NE(m_listener_sock, SRT_INVALID_SOCK);
-    {
-        const SRT_VirtualTransportConfig cfg = m_listener_queue.getConfig(seed_rtt_ms, 1);
-        ASSERT_EQ(srt_bind_virtual(m_listener_sock, (const sockaddr*)&listener_addr, (int)sizeof listener_addr, &cfg),
-                  SRT_STATUS_OK)
-            << srt_getlasterror_str();
-    }
+    BindVirtualConclusionFirst(m_listener_sock, listener_addr, m_listener_queue.getConfig(seed_rtt_ms));
     ASSERT_NE(srt_listen(m_listener_sock, 4), SRT_ERROR) << srt_getlasterror_str();
 
     m_caller_sock = srt_create_socket();
     ASSERT_NE(m_caller_sock, SRT_INVALID_SOCK);
-    {
-        const SRT_VirtualTransportConfig cfg = m_caller_queue.getConfig(seed_rtt_ms, 1);
-        ASSERT_EQ(srt_bind_virtual(m_caller_sock, (const sockaddr*)&caller_addr, (int)sizeof caller_addr, &cfg),
-                  SRT_STATUS_OK)
-            << srt_getlasterror_str();
-    }
+    BindVirtualConclusionFirst(m_caller_sock, caller_addr, m_caller_queue.getConfig(seed_rtt_ms));
 
     ASSERT_NE(srt_connect(m_caller_sock, (const sockaddr*)&listener_addr, (int)sizeof listener_addr), SRT_ERROR)
         << srt_getlasterror_str();
@@ -1016,16 +984,12 @@ TEST_F(TestVirtualTransport, RendezvousWithVirtualRejected)
     const sockaddr_in self_addr = FillV4("10.218.0.1", 5555);
     const sockaddr_in peer_addr = FillV4("10.218.0.2", 5555);
 
-    // A skip-induction multiplexer, the config the refusal is guarding.
+    // A conclusion-first multiplexer through the internal bind - the
+    // configuration the refusal is guarding.
     m_caller_sock = srt_create_socket();
     ASSERT_NE(m_caller_sock, SRT_INVALID_SOCK);
     m_caller_wire.sock = m_caller_sock;
-    {
-        const SRT_VirtualTransportConfig cfg = m_caller_queue.getConfig(0, 1);
-        ASSERT_EQ(srt_bind_virtual(m_caller_sock, (const sockaddr*)&self_addr, (int)sizeof self_addr, &cfg),
-                  SRT_STATUS_OK)
-            << srt_getlasterror_str();
-    }
+    BindVirtualConclusionFirst(m_caller_sock, self_addr, m_caller_queue.getConfig());
 
     // Rendezvous set AFTER the virtual bind: accepted at set time (the
     // option only demands that the socket not be connecting yet)...
@@ -1072,28 +1036,19 @@ TEST_F(TestVirtualTransport, DuplicateSourceLabelRejected)
 
     PairWires(shared_addr, listener_addr);
 
-    // The listener in the intended mode: skip_induction.
+    // The listener in the intended mode: conclusion-first through the
+    // internal bind.
     m_listener_sock = srt_create_socket();
     ASSERT_NE(m_listener_sock, SRT_INVALID_SOCK);
     m_listener_wire.sock = m_listener_sock;
-    {
-        const SRT_VirtualTransportConfig cfg = m_listener_queue.getConfig(0, 1);
-        ASSERT_EQ(srt_bind_virtual(m_listener_sock, (const sockaddr*)&listener_addr, (int)sizeof listener_addr, &cfg),
-                  SRT_STATUS_OK)
-            << srt_getlasterror_str();
-    }
+    BindVirtualConclusionFirst(m_listener_sock, listener_addr, m_listener_queue.getConfig());
     ASSERT_NE(srt_listen(m_listener_sock, 4), SRT_ERROR) << srt_getlasterror_str();
 
     // The FIRST caller on the label connects fine.
     m_caller_sock = srt_create_socket();
     ASSERT_NE(m_caller_sock, SRT_INVALID_SOCK);
     m_caller_wire.sock = m_caller_sock;
-    {
-        const SRT_VirtualTransportConfig cfg = m_caller_queue.getConfig(0, 1);
-        ASSERT_EQ(srt_bind_virtual(m_caller_sock, (const sockaddr*)&shared_addr, (int)sizeof shared_addr, &cfg),
-                  SRT_STATUS_OK)
-            << srt_getlasterror_str();
-    }
+    BindVirtualConclusionFirst(m_caller_sock, shared_addr, m_caller_queue.getConfig());
 
     ASSERT_NE(srt_connect(m_caller_sock, (const sockaddr*)&listener_addr, (int)sizeof listener_addr), SRT_ERROR)
         << srt_getlasterror_str();
@@ -1132,12 +1087,7 @@ TEST_F(TestVirtualTransport, DuplicateSourceLabelRejected)
     SRTSOCKET dup_sock = srt_create_socket();
     ASSERT_NE(dup_sock, SRT_INVALID_SOCK);
     dup_wire.sock = dup_sock;
-    {
-        const SRT_VirtualTransportConfig cfg = dup_queue.getConfig(0, 1);
-        ASSERT_EQ(srt_bind_virtual(dup_sock, (const sockaddr*)&shared_addr, (int)sizeof shared_addr, &cfg),
-                  SRT_STATUS_OK)
-            << srt_getlasterror_str();
-    }
+    BindVirtualConclusionFirst(dup_sock, shared_addr, dup_queue.getConfig());
     const int conn_timeout_ms = 500;
     ASSERT_NE(srt_setsockopt(dup_sock, 0, SRTO_CONNTIMEO, &conn_timeout_ms, sizeof conn_timeout_ms), SRT_ERROR)
         << srt_getlasterror_str();
@@ -1229,28 +1179,18 @@ TEST_F(TestVirtualTransport, CloseDuringLiveTraffic)
 
     PairWires(caller_addr, listener_addr);
 
-    // Listener side: skip_induction both ways, as a WebTransport gateway
-    // would configure its sessions.
+    // Listener side: conclusion-first both ways (the internal bind), as a
+    // WebTransport gateway would configure its sessions.
     m_listener_sock = srt_create_socket();
     ASSERT_NE(m_listener_sock, SRT_INVALID_SOCK);
     m_listener_wire.sock = m_listener_sock;
-    {
-        const SRT_VirtualTransportConfig cfg = m_listener_queue.getConfig(0, 1);
-        ASSERT_EQ(srt_bind_virtual(m_listener_sock, (const sockaddr*)&listener_addr, (int)sizeof listener_addr, &cfg),
-                  SRT_STATUS_OK)
-            << srt_getlasterror_str();
-    }
+    BindVirtualConclusionFirst(m_listener_sock, listener_addr, m_listener_queue.getConfig());
     ASSERT_NE(srt_listen(m_listener_sock, 4), SRT_ERROR) << srt_getlasterror_str();
 
     m_caller_sock = srt_create_socket();
     ASSERT_NE(m_caller_sock, SRT_INVALID_SOCK);
     m_caller_wire.sock = m_caller_sock;
-    {
-        const SRT_VirtualTransportConfig cfg = m_caller_queue.getConfig(0, 1);
-        ASSERT_EQ(srt_bind_virtual(m_caller_sock, (const sockaddr*)&caller_addr, (int)sizeof caller_addr, &cfg),
-                  SRT_STATUS_OK)
-            << srt_getlasterror_str();
-    }
+    BindVirtualConclusionFirst(m_caller_sock, caller_addr, m_caller_queue.getConfig());
 
     ASSERT_NE(srt_connect(m_caller_sock, (const sockaddr*)&listener_addr, (int)sizeof listener_addr), SRT_ERROR)
         << srt_getlasterror_str();
@@ -1458,12 +1398,7 @@ TEST_F(TestVirtualTransport, MultiAcceptSharedListenerMultiplexer)
 
     rig.listener = srt_create_socket();
     ASSERT_NE(rig.listener, SRT_INVALID_SOCK);
-    {
-        const SRT_VirtualTransportConfig cfg = rig.listener_queue.getConfig(0, 1);
-        ASSERT_EQ(srt_bind_virtual(rig.listener, (const sockaddr*)&listener_addr, (int)sizeof listener_addr, &cfg),
-                  SRT_STATUS_OK)
-            << srt_getlasterror_str();
-    }
+    BindVirtualConclusionFirst(rig.listener, listener_addr, rig.listener_queue.getConfig());
     // Everything the shared queue sends out reports the listener's label as
     // its source; the switch routes it to the caller the datagram is
     // addressed to.
@@ -1481,12 +1416,7 @@ TEST_F(TestVirtualTransport, MultiAcceptSharedListenerMultiplexer)
         s.caller = srt_create_socket();
         ASSERT_NE(s.caller, SRT_INVALID_SOCK);
         s.caller_wire.sock = s.caller;
-        {
-            const SRT_VirtualTransportConfig cfg = s.caller_queue.getConfig(0, 1);
-            ASSERT_EQ(srt_bind_virtual(s.caller, (const sockaddr*)&s.caller_addr, (int)sizeof s.caller_addr, &cfg),
-                      SRT_STATUS_OK)
-                << srt_getlasterror_str();
-        }
+        BindVirtualConclusionFirst(s.caller, s.caller_addr, s.caller_queue.getConfig());
         s.caller_wire.peer = &rig.listener_queue;
         FillWireSource(s.caller_wire, s.caller_addr);
         rig.listener_switch.routes.push_back(Switch::Route{ s.caller_addr, &s.caller_queue });
@@ -1616,12 +1546,7 @@ TEST_F(TestVirtualTransport, DedicatedMuxerSameLabel)
         p.listener = srt_create_socket();
         ASSERT_NE(p.listener, SRT_INVALID_SOCK);
         p.listener_wire.sock = p.listener;
-        {
-            const SRT_VirtualTransportConfig cfg = p.listener_queue.getConfig(0, 1);
-            ASSERT_EQ(srt_bind_virtual(p.listener, (const sockaddr*)&p.listener_addr, (int)sizeof p.listener_addr, &cfg),
-                      SRT_STATUS_OK)
-                << srt_getlasterror_str();
-        }
+        BindVirtualConclusionFirst(p.listener, p.listener_addr, p.listener_queue.getConfig());
         p.listener_wire.peer = &p.caller_queue;
         FillWireSource(p.listener_wire, p.listener_addr);
         ASSERT_NE(srt_listen(p.listener, 4), SRT_ERROR) << srt_getlasterror_str();
@@ -1634,12 +1559,7 @@ TEST_F(TestVirtualTransport, DedicatedMuxerSameLabel)
         p.caller = srt_create_socket();
         ASSERT_NE(p.caller, SRT_INVALID_SOCK);
         p.caller_wire.sock = p.caller;
-        {
-            const SRT_VirtualTransportConfig cfg = p.caller_queue.getConfig(0, 1);
-            ASSERT_EQ(srt_bind_virtual(p.caller, (const sockaddr*)&shared_label, (int)sizeof shared_label, &cfg),
-                      SRT_STATUS_OK)
-                << srt_getlasterror_str();
-        }
+        BindVirtualConclusionFirst(p.caller, shared_label, p.caller_queue.getConfig());
         ExpectSockName(p.caller, shared_label);
         p.caller_wire.peer = &p.listener_queue;
         FillWireSource(p.caller_wire, shared_label);
@@ -1754,12 +1674,7 @@ TEST_F(TestVirtualTransport, ReceiverDropsTooLateMissingPacket)
     ASSERT_NE(srt_setsockopt(m_listener_sock, 0, SRTO_LATENCY, &latency_ms, sizeof latency_ms), SRT_ERROR)
         << srt_getlasterror_str();
     m_listener_wire.sock = m_listener_sock;
-    {
-        const SRT_VirtualTransportConfig cfg = m_listener_queue.getConfig(0, 1);
-        ASSERT_EQ(srt_bind_virtual(m_listener_sock, (const sockaddr*)&listener_addr, (int)sizeof listener_addr, &cfg),
-                  SRT_STATUS_OK)
-            << srt_getlasterror_str();
-    }
+    BindVirtualConclusionFirst(m_listener_sock, listener_addr, m_listener_queue.getConfig());
     ASSERT_NE(srt_listen(m_listener_sock, 4), SRT_ERROR) << srt_getlasterror_str();
 
     m_caller_sock = srt_create_socket();
@@ -1767,12 +1682,7 @@ TEST_F(TestVirtualTransport, ReceiverDropsTooLateMissingPacket)
     ASSERT_NE(srt_setsockopt(m_caller_sock, 0, SRTO_LATENCY, &latency_ms, sizeof latency_ms), SRT_ERROR)
         << srt_getlasterror_str();
     m_caller_wire.sock = m_caller_sock;
-    {
-        const SRT_VirtualTransportConfig cfg = m_caller_queue.getConfig(0, 1);
-        ASSERT_EQ(srt_bind_virtual(m_caller_sock, (const sockaddr*)&caller_addr, (int)sizeof caller_addr, &cfg),
-                  SRT_STATUS_OK)
-            << srt_getlasterror_str();
-    }
+    BindVirtualConclusionFirst(m_caller_sock, caller_addr, m_caller_queue.getConfig());
 
     ASSERT_NE(srt_connect(m_caller_sock, (const sockaddr*)&listener_addr, (int)sizeof listener_addr), SRT_ERROR)
         << srt_getlasterror_str();

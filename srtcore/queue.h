@@ -1085,7 +1085,7 @@ public:
     CUDT* getListener() { return m_RcvQueue.getListener(); }
 
     void configure(int32_t id, const CSrtConfig& config, const sockaddr_any& reqaddr, const SYSSOCKET* udpsock,
-                   const SRT_VirtualTransportConfig* vtcfg = NULL);
+                   const SRT_VirtualTransportConfig* vtcfg = NULL, bool conclusion_first = false);
 
     // Update the socket in the sender list according to current time.
     // Already scheduled sockets with future time will be ordered after it.
