@@ -91,6 +91,9 @@ elseif(DARWIN)
 elseif(BSD)
 	message(STATUS "DETECTED SYSTEM: BSD;  BSD=1")
 	add_definitions(-DBSD=1)
+elseif(EMSCRIPTEN)
+	add_definitions(-DLINUX=1)
+	message(STATUS "DETECTED SYSTEM: EMSCRIPTEN;  LINUX=1 (preprocessor only: Emscripten's musl-libc compiles the Linux code paths, but the CMake LINUX variable stays unset so Linux-only extras like -lrt and BINDTODEVICE stay off)")
 elseif(LINUX)
 	add_definitions(-DLINUX=1)
 	message(STATUS "DETECTED SYSTEM: LINUX;  LINUX=1" )
@@ -360,6 +363,22 @@ option(ENABLE_LOCALIF_WIN32 "Enable local interface check ability on Windows (ad
 option(ENABLE_AEAD "Enable AEAD API preview in SRT" ON)
 option(ENABLE_MAXREXMITBW "Enable SRTO_MAXREXMITBW (limiting rexmit bandwidth)" ON)
 option(ENABLE_VIRTUAL_TRANSPORT "Enable the virtual transport seam: sockets exchanging datagrams through an owner-supplied transport instead of an OS UDP socket (Linux and Emscripten)" OFF)
+
+# The srtcore seam of the virtual transport is C++98-clean, but the
+# Emscripten build compiles the srttransport helper (std::mutex,
+# std::condition_variable) against the library, so it needs at least C++11.
+# Scoped to Emscripten: a plain Linux build keeps the stock standard.
+# Must run before the USE_CXX_STD processing below.
+if (ENABLE_VIRTUAL_TRANSPORT AND EMSCRIPTEN)
+	if (DEFINED USE_CXX_STD)
+		srt_check_cxxstd(${USE_CXX_STD} VT_STDCXX VT_STDPFX)
+		if (${VT_STDCXX} LESS 11)
+			message(FATAL_ERROR "If ENABLE_VIRTUAL_TRANSPORT with Emscripten, then USE_CXX_STD must specify at least C++11")
+		endif()
+	else()
+		set (USE_CXX_STD 11)
+	endif()
+endif()
 
 # Variant selection
 option(USE_STATIC_LIBSTDCXX "Should use static rather than shared libstdc++" OFF)
