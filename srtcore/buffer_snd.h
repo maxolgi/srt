@@ -567,6 +567,22 @@ private:
 
     void initialize();
 
+    /// Sum the payload bytes of the leading packets that pop(upto) would
+    /// remove: the non-busy prefix of [0, upto), clamped to the container
+    /// size (pop() stops at the first busy packet). Used by the removal
+    /// paths to keep m_iBytesCount in sync with the buffer's content.
+    SRT_TSA_NEEDS_LOCKED(m_BufLock)
+    int countPrefixBytes(int upto) const
+    {
+        const int size = int(m_Packets.size());
+        if (upto > size)
+            upto = size;
+        int bytes = 0;
+        for (int i = 0; i < upto && m_Packets[i].m_iBusy == 0; ++i)
+            bytes += m_Packets[i].m_iLength;
+        return bytes;
+    }
+
     SRT_TSA_NEEDS_LOCKED(m_BufLock)
     void updAvgBufSize(const time_point& time);
 
