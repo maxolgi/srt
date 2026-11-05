@@ -1737,3 +1737,121 @@ TEST_F(TestVirtualTransport, ReceiverDropsTooLateMissingPacket)
     EXPECT_EQ(srt_close(m_listener_sock), SRT_STATUS_OK) << srt_getlasterror_str();
     m_listener_sock = SRT_INVALID_SOCK;
 }
+
+// A connecting socket must never be observable as SRTS_BROKEN while its
+// connection is still being established or completed.
+// CUDTSocket::getStatus() used to synthesize SRTS_BROKEN out of the pair
+// (m_State not in {CONNECTING, CONNECTED, BROKEN}, m_Status ==
+// SRTS_CONNECTING) - a combination that every state/status transition of a
+// connecting caller produces on another thread's read interleaving (the
+// two atomics are stored one after the other). An application polling
+// srt_getsockstate() - the QuicSRT gateway polls every session on its
+// ~2 ms registry tick - could catch such a pair and tear down a live
+// connection: freshly connected sessions were intermittently reaped and
+// their sockets went silent until the peer's peer-idle timeout. This test
+// drives many conclusion-first connects while one thread churns
+// global-lock-holding API calls (stretching the transition windows) and
+// another samples the socket state exactly the way the gateway does;
+// over lossless in-memory wires a BROKEN observation can only be the bug.
+TEST_F(TestVirtualTransport, ConnectingStateNeverFalselyBroken)
+{
+    const int num_pairs = 100;
+
+    // A churn thread: bare create/close cycles hold the global control
+    // lock briefly each time, contending the very locks the connect
+    // completion path takes (the more contention, the wider the
+    // state/status transition windows - the test must catch them).
+    std::atomic<bool> churn_stop{false};
+    std::thread churn(
+        [&churn_stop]
+        {
+            while (!churn_stop.load(std::memory_order_relaxed))
+            {
+                const SRTSOCKET dummy = srt_create_socket();
+                if (dummy != SRT_INVALID_SOCK)
+                    srt_close(dummy);
+                std::this_thread::yield();
+            }
+        });
+
+    for (int i = 0; i < num_pairs; ++i)
+    {
+        // Unique labels per iteration (the virtual demux keys off them).
+        const sockaddr_in listener_addr = FillV4("10.215.7.9", uint16_t(30000 + (i % 1000)));
+        const sockaddr_in caller_addr   = FillV4("10.215.7.8", uint16_t(30000 + (i % 1000)));
+
+        Wire               caller_wire, listener_wire;
+        srt::SRTTransportQueue caller_queue(&WireSend, &caller_wire);
+        srt::SRTTransportQueue listener_queue(&WireSend, &listener_wire);
+        caller_wire.peer = &listener_queue;
+        FillWireSource(caller_wire, caller_addr);
+        listener_wire.peer = &caller_queue;
+        FillWireSource(listener_wire, listener_addr);
+
+        SRTSOCKET listener_sock = srt_create_socket();
+        ASSERT_NE(listener_sock, SRT_INVALID_SOCK);
+        BindVirtualConclusionFirst(listener_sock, listener_addr, listener_queue.getConfig());
+        ASSERT_NE(srt_listen(listener_sock, 4), SRT_ERROR) << srt_getlasterror_str();
+
+        SRTSOCKET caller_sock = srt_create_socket();
+        ASSERT_NE(caller_sock, SRT_INVALID_SOCK);
+        const int no_block = 0; // asynchronous connect, like the gateway initiator
+        ASSERT_EQ(srt_setsockopt(caller_sock, 0, SRTO_RCVSYN, &no_block, sizeof no_block), 0);
+        BindVirtualConclusionFirst(caller_sock, caller_addr, caller_queue.getConfig());
+
+        // The state sampler: spins on srt_getsockstate like the gateway's
+        // registry tick, until the socket is connected (or broken, or the
+        // deadline hits). Any SRTS_BROKEN over a lossless wire is the bug.
+        std::atomic<bool> seen_broken{false};
+        std::atomic<bool> seen_connected{false};
+        std::thread sampler(
+            [caller_sock, &seen_broken, &seen_connected]
+            {
+                const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+                while (std::chrono::steady_clock::now() < deadline)
+                {
+                    const SRT_SOCKSTATUS st = srt_getsockstate(caller_sock);
+                    if (st == SRTS_BROKEN)
+                    {
+                        seen_broken.store(true, std::memory_order_relaxed);
+                        return;
+                    }
+                    if (st == SRTS_CONNECTED)
+                    {
+                        seen_connected.store(true, std::memory_order_relaxed);
+                        return;
+                    }
+                    std::this_thread::yield();
+                }
+            });
+
+        ASSERT_NE(srt_connect(caller_sock, (const sockaddr*)&listener_addr, sizeof listener_addr), SRT_ERROR)
+            << srt_getlasterror_str();
+
+        sampler.join();
+        EXPECT_TRUE(seen_connected.load()) << "pair " << i << ": the connection never completed";
+        EXPECT_FALSE(seen_broken.load()) << "pair " << i
+                                         << ": a connecting socket was reported SRTS_BROKEN "
+                                            "(false-broken window in postConnect)";
+
+        // Accept and close, in the teardown order the other tests use.
+        if (WaitReadable(listener_sock, 5000))
+        {
+            sockaddr_in accept_addr;
+            int         accept_len = (int)sizeof accept_addr;
+            const SRTSOCKET accepted = srt_accept(listener_sock, (sockaddr*)&accept_addr, &accept_len);
+            if (accepted != SRT_INVALID_SOCK)
+            {
+                EXPECT_EQ(srt_close(accepted), SRT_STATUS_OK);
+            }
+        }
+        EXPECT_EQ(srt_close(caller_sock), SRT_STATUS_OK);
+        EXPECT_EQ(srt_close(listener_sock), SRT_STATUS_OK);
+
+        if (HasFailure())
+            break;
+    }
+
+    churn_stop.store(true, std::memory_order_relaxed);
+    churn.join();
+}
