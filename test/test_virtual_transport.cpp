@@ -1772,7 +1772,7 @@ TEST_F(TestVirtualTransport, ReceiverDropsTooLateMissingPacket)
 // SRTS_CONNECTING) - a combination that every state/status transition of a
 // connecting caller produces on another thread's read interleaving (the
 // two atomics are stored one after the other). An application polling
-// srt_getsockstate() - the QuicSRT gateway polls every session on its
+// srt_getsockstate() - a WebTransport gateway polls every session on its
 // ~2 ms registry tick - could catch such a pair and tear down a live
 // connection: freshly connected sessions were intermittently reaped and
 // their sockets went silent until the peer's peer-idle timeout. This test

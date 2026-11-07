@@ -136,7 +136,7 @@ SRT_SOCKSTATUS CUDTSocket::getStatus()
     // catch a cross-transition pair. Most notably, mapping
     // (non-{CONNECTING, CONNECTED, BROKEN} state, SRTS_CONNECTING status)
     // to SRTS_BROKEN reported a connection that was only starting or
-    // finishing its handshake as broken - the QuicSRT gateway polls
+    // finishing its handshake as broken - a WebTransport gateway polls
     // srt_getsockstate() on a ~2 ms registry tick and intermittently tore
     // down freshly connected sessions this way. A socket therefore reports
     // the status as-is; the failure path that used to rely on that mapping
