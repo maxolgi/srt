@@ -230,7 +230,7 @@ protected:
 
     // Picks a free UDP port number for the SRT sockets of one test to bind:
     // binds port 0 on a short-lived raw UDP socket and reads the chosen
-    // number back. The SRT bind that immediately follows re-uses the number,
+    // number back. The SRT bind that immediately follows reuses the number,
     // so parallel test processes never collide on a shared fixed port.
     static int PickPortNumber()
     {
