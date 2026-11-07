@@ -1,6 +1,7 @@
 name: Linux Virtual Transport
 
 on:
+  workflow_dispatch:
   push:
     branches: [ "master", "dev", "ci-rehearsal" ]
   pull_request:
