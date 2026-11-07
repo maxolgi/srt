@@ -48,9 +48,8 @@ jobs:
       # The virtual transport tests exist only in the ON build; the
       # stock-build rejection tests only have content in the OFF build.
       # Run the full suite in every leg so neither side silently rots.
-      # Serial, like windows-msvc-noenc.yml: many suites bind fixed ports
-      # and collide under -j greater than 1. The -E list mirrors the
-      # Windows workflow (these tests hang or flake on shared runners),
-      # and --timeout caps any other hang at 60s instead of ctest's
-      # 1500s default.
-      run: cd _build && ctest --output-on-failure --timeout 60 -E "TestIPv6.v6_calls_v4|TestConnectionTimeout.BlockingLoop"
+      # Tests bind port 0 and read the assigned port back, so the suite
+      # is safe to run in parallel. The -E list mirrors windows-msvc-noenc.yml
+      # (these tests hang or flake on shared runners), and --timeout caps any
+      # other hang at 60s instead of ctest's 1500s default.
+      run: cd _build && ctest --output-on-failure -j 4 --timeout 60 -E "TestIPv6.v6_calls_v4|TestConnectionTimeout.BlockingLoop"
