@@ -3777,17 +3777,24 @@ void CUDT::startConnect(const sockaddr_any& serv_addr, int32_t forced_isn)
     // it structurally false.
     const bool concl = m_pMuxer && m_pMuxer->channel()->conclusionFirst();
 
+    // A virtual transport channel is one whose datagrams flow through
+    // owner callbacks instead of an OS UDP socket; a stock UDP channel
+    // carries no virtual configuration.
+    const bool vtrans = m_pMuxer && m_pMuxer->channel()->vtconfig() != NULL;
+
     // This is my current configuration
     if (m_config.bRendezvous)
     {
-        // The conclusion-first handshake relies on the caller-listener
-        // layout. Note that srt_bind_virtual() rejects a
-        // socket that has rendezvous already set; this covers the reverse
-        // order, when SRTO_RENDEZVOUS is set after srt_bind_virtual().
-        if (concl)
+        // The virtual transport relies on the caller-listener layout.
+        // Note that srt_bind_virtual() rejects a socket that has
+        // rendezvous already set; this covers the reverse order, when
+        // SRTO_RENDEZVOUS is set after srt_bind_virtual(). This subsumes
+        // the conclusion-first case, which is only reachable through a
+        // channel that has a virtual configuration.
+        if (vtrans)
         {
             LOGC(aclog.Error,
-                 log << CONID() << "startConnect: the conclusion-first handshake is not supported in rendezvous mode.");
+                 log << CONID() << "startConnect: rendezvous is not supported over a virtual transport channel.");
             // The connector has been registered above, but this socket never
             // reaches the connecting state (m_State is set to SSS_CONNECTING
             // only past the first handshake send), so the connector-cleanup
