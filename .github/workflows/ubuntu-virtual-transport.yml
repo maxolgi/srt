@@ -11,8 +11,20 @@ jobs:
   build:
     strategy:
         matrix:
-            virtual_transport: [ON, OFF]
-    name: ENABLE_VIRTUAL_TRANSPORT ${{ matrix.virtual_transport }}
+            include:
+                - name: ENABLE_VIRTUAL_TRANSPORT=ON, C++03, POSIX sync
+                  virtual_transport: ON
+                  std: 03
+                  extra_flags: "-sync posix"
+                - name: ENABLE_VIRTUAL_TRANSPORT=ON, C++17
+                  virtual_transport: ON
+                  std: 17
+                  extra_flags: ""
+                - name: ENABLE_VIRTUAL_TRANSPORT=OFF, C++17
+                  virtual_transport: OFF
+                  std: 17
+                  extra_flags: ""
+    name: ${{ matrix.name }}
     runs-on: ubuntu-latest
     steps:
 
@@ -22,15 +34,18 @@ jobs:
       run: ./scripts/workflows/build/ubuntu-prepare-environment.sh
 
     - name: configure
+      # The C++03 leg mirrors ubuntu-c++03.yml: the srtcore seam of
+      # this feature must stay C++98-clean, so the strictest leg builds
+      # it at the -std 03 floor with warnings as errors.
       run: >
-        ./scripts/workflows/build/configure.sh _build -std 17 -werror on
-        -ut on -bonding on -- -DENABLE_VIRTUAL_TRANSPORT=${{ matrix.virtual_transport }}
+        ./scripts/workflows/build/configure.sh _build ${{ matrix.extra_flags }} -std ${{ matrix.std }}
+        -bonding on -werror on -ut on -- -DENABLE_VIRTUAL_TRANSPORT=${{ matrix.virtual_transport }}
 
     - name: build
       run: ./scripts/workflows/build/build.sh _build
 
     - name: test
-      # The feature tests (VirtualTransport, TransportQueue) exist only in
-      # the ON build; in the OFF build the same selection runs the
-      # stock-build guard tests (TestVirtualTransportStock).
-      run: cd _build && ctest --output-on-failure -R "VirtualTransport|TransportQueue" -j 2
+      # The virtual transport tests exist only in the ON build; the
+      # stock-build rejection tests only have content in the OFF build.
+      # Run the full suite in every leg so neither side silently rots.
+      run: cd _build && ctest --output-on-failure -j 2
