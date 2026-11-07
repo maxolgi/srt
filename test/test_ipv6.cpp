@@ -204,7 +204,17 @@ private:
 protected:
     SRTSOCKET m_caller_sock;
     SRTSOCKET m_listener_sock;
-    const int m_listen_port = 4200;
+    // Filled from the port the kernel picks when the listener binds (port 0),
+    // so that parallel test processes never collide.
+    int m_listen_port = 0;
+
+    // Reads back the kernel-picked port of a freshly bound listener.
+    void PickupPort(SRTSOCKET lsn)
+    {
+        sockaddr_any sa;
+        ASSERT_EQ(srt_getsockname(lsn, sa.get(), &sa.len), 0);
+        m_listen_port = sa.hport();
+    }
 };
 
 
@@ -216,11 +226,12 @@ TEST_F(TestIPv6, v4_calls_v6_mapped)
     ASSERT_EQ(srt_setsockflag(m_listener_sock, SRTO_IPV6ONLY, &no, sizeof no), 0);
     ASSERT_NE(srt_bind(m_listener_sock, sa.get(), sa.size()), SRT_ERROR);
     ASSERT_NE(srt_listen(m_listener_sock, SOMAXCONN), SRT_ERROR);
+    PickupPort(m_listener_sock);
 
     std::thread client(&TestIPv6::ClientThread, this, AF_INET, "127.0.0.1");
 
     const sockaddr_any sa_accepted = DoAccept();
-    EXPECT_EQ(sa_accepted.str(), "[::ffff:127.0.0.1]:4200");
+    EXPECT_EQ(sa_accepted.str(), std::string("[::ffff:127.0.0.1]:") + std::to_string(m_listen_port));
 
     client.join();
 }
@@ -235,11 +246,12 @@ TEST_F(TestIPv6, v6_calls_v6_mapped)
     ASSERT_EQ(srt_setsockflag(m_listener_sock, SRTO_IPV6ONLY, &no, sizeof no), 0);
     ASSERT_NE(srt_bind(m_listener_sock, sa.get(), sa.size()), SRT_ERROR);
     ASSERT_NE(srt_listen(m_listener_sock, SOMAXCONN), SRT_ERROR);
+    PickupPort(m_listener_sock);
 
     std::thread client(&TestIPv6::ClientThread, this, AF_INET6, "::1");
 
     const sockaddr_any sa_accepted = DoAccept();
-    EXPECT_EQ(sa_accepted.str(), "[::1]:4200");
+    EXPECT_EQ(sa_accepted.str(), std::string("[::1]:") + std::to_string(m_listen_port));
 
     client.join();
 }
@@ -257,11 +269,12 @@ TEST_F(TestIPv6, v6_calls_v6)
 
     ASSERT_NE(srt_bind(m_listener_sock, sa.get(), sa.size()), SRT_ERROR);
     ASSERT_NE(srt_listen(m_listener_sock, SOMAXCONN), SRT_ERROR);
+    PickupPort(m_listener_sock);
 
     std::thread client(&TestIPv6::ClientThread, this, AF_INET6, "::1");
 
     const sockaddr_any sa_accepted = DoAccept();
-    EXPECT_EQ(sa_accepted.str(), "[::1]:4200");
+    EXPECT_EQ(sa_accepted.str(), std::string("[::1]:") + std::to_string(m_listen_port));
 
     client.join();
 }
@@ -276,11 +289,12 @@ TEST_F(TestIPv6, v6_calls_v4)
 
     ASSERT_NE(srt_bind(m_listener_sock, sa.get(), sa.size()), SRT_ERROR);
     ASSERT_NE(srt_listen(m_listener_sock, SOMAXCONN), SRT_ERROR);
+    PickupPort(m_listener_sock);
 
     std::thread client(&TestIPv6::ClientThread, this, AF_INET6, "0::FFFF:127.0.0.1");
 
     const sockaddr_any sa_accepted = DoAccept();
-    EXPECT_EQ(sa_accepted.str(), "127.0.0.1:4200");
+    EXPECT_EQ(sa_accepted.str(), std::string("127.0.0.1:") + std::to_string(m_listen_port));
 
     client.join();
 }
@@ -299,6 +313,7 @@ TEST_F(TestIPv6, v6_payload_size_reduced)
     ASSERT_EQ(inet_pton(AF_INET6, "::1", sa.get_addr()), 1);
     ASSERT_NE(srt_bind(m_listener_sock, sa.get(), sa.size()), SRT_ERROR);
     ASSERT_NE(srt_listen(m_listener_sock, SOMAXCONN), SRT_ERROR);
+    PickupPort(m_listener_sock);
 
     std::thread client(&TestIPv6::ClientThread, this, AF_INET6, "::1");
     DoAccept();
@@ -321,6 +336,7 @@ TEST_F(TestIPv6, v4_mapped_payload_size_kept)
     ASSERT_EQ(srt_setsockflag(m_listener_sock, SRTO_IPV6ONLY, &no, sizeof no), 0);
     ASSERT_NE(srt_bind(m_listener_sock, sa.get(), sa.size()), SRT_ERROR);
     ASSERT_NE(srt_listen(m_listener_sock, SOMAXCONN), SRT_ERROR);
+    PickupPort(m_listener_sock);
 
     std::thread client(&TestIPv6::ClientThread, this, AF_INET, "127.0.0.1");
     DoAccept();
@@ -352,6 +368,7 @@ TEST_F(TestIPv6, v6_payload_size_respects_mss)
     ASSERT_EQ(inet_pton(AF_INET6, "::1", sa.get_addr()), 1);
     ASSERT_NE(srt_bind(m_listener_sock, sa.get(), sa.size()), SRT_ERROR);
     ASSERT_NE(srt_listen(m_listener_sock, SOMAXCONN), SRT_ERROR);
+    PickupPort(m_listener_sock);
 
     std::thread client(&TestIPv6::ClientThread, this, AF_INET6, "::1");
     DoAccept();
@@ -377,6 +394,7 @@ TEST_F(TestIPv6, plsize_v6)
 
     ASSERT_NE(srt_bind(m_listener_sock, sa.get(), sa.size()), SRT_ERROR);
     ASSERT_NE(srt_listen(m_listener_sock, SOMAXCONN), SRT_ERROR);
+    PickupPort(m_listener_sock);
 
     std::thread client(&TestIPv6::ClientThread, this, AF_INET6, "::1");
 
@@ -400,6 +418,7 @@ TEST_F(TestIPv6, plsize_v4)
 
     ASSERT_NE(srt_bind(m_listener_sock, sa.get(), sa.size()), SRT_ERROR);
     ASSERT_NE(srt_listen(m_listener_sock, SOMAXCONN), SRT_ERROR);
+    PickupPort(m_listener_sock);
 
     std::thread client(&TestIPv6::ClientThread, this, AF_INET6, "0::FFFF:127.0.0.1");
 
@@ -427,6 +446,7 @@ TEST_F(TestIPv6, plsize_faux_v6)
 
     ASSERT_NE(srt_bind(m_listener_sock, sa.get(), sa.size()), SRT_ERROR);
     ASSERT_NE(srt_listen(m_listener_sock, SOMAXCONN), SRT_ERROR);
+    PickupPort(m_listener_sock);
 
     int oversize = 1450;
     ASSERT_NE(srt_setsockflag(m_caller_sock, SRTO_PAYLOADSIZE, &oversize, sizeof (int)), -1);

@@ -48,14 +48,17 @@ protected:
     int       m_pollid = 0;
 public:
 
-    void BindListener() const
+    void BindListener()
     {
-        // Specify address of the listener
+        // Specify address of the listener. The port comes from the setup
+        // as 0, so the kernel picks a free one; it is read back into m_sa
+        // so that parallel test processes never collide on a fixed port.
         const auto* psa = (const sockaddr*)&m_sa;
         ASSERT_NE(srt_bind(m_listen_sock, psa, sizeof m_sa), SRT_ERROR);
+        ASSERT_EQ(srt_getsockname(m_listen_sock, m_sa.get(), &m_sa.len), SRT_SUCCESS);
     }
 
-    void StartListener() const
+    void StartListener()
     {
         BindListener();
 
@@ -110,7 +113,7 @@ protected:
     void setup() override
     {
         const int yes = 1;
-        m_sa = srt::CreateAddr("127.0.0.1", 5200, AF_INET);
+        m_sa = srt::CreateAddr("127.0.0.1", 0, AF_INET); // the kernel picks the port at bind
         ASSERT_FALSE(m_sa.empty());
 
         m_caller_sock = srt_create_socket();
@@ -139,7 +142,7 @@ protected:
     {
         const int yes = 1;
 
-        m_sa = srt::CreateAddr("127.0.0.1", 5200, AF_INET);
+        m_sa = srt::CreateAddr("127.0.0.1", 0, AF_INET); // the kernel picks the port at bind
         ASSERT_FALSE(m_sa.empty());
 
         m_caller_sock = srt_create_group(SRT_GTYPE_BROADCAST);

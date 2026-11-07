@@ -64,8 +64,11 @@ public:
 
         ASSERT_NE(listener = srt_create_socket(), SRT_INVALID_SOCK);
 
-        srt::sockaddr_any sa = srt::CreateAddr("localhost", 5555, AF_INET);
+        // Port 0: the kernel picks a free one, read back after the bind so
+        // that parallel test processes never collide.
+        srt::sockaddr_any sa = srt::CreateAddr("localhost", 0, AF_INET);
         ASSERT_NE(srt_bind(listener, sa.get(), sa.size()), SRT_ERROR);
+        ASSERT_EQ(srt_getsockname(listener, sa.get(), &sa.len), SRT_SUCCESS);
         ASSERT_NE(srt_listen(listener, 1), SRT_ERROR);
 
         std::thread spawned_connect( [this, &sa] { EXPECT_NE(srt_connect(caller, sa.get(), sa.size()), SRT_ERROR); });

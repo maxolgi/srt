@@ -42,7 +42,7 @@ public:
 
     void setup()
     {
-        // Create server on 127.0.0.1:5555
+        // Create server on 127.0.0.1, kernel-picked port.
 
         server_sock = srt_create_socket();
         ASSERT_GT(server_sock, 0);    // socket_id should be > 0
@@ -51,13 +51,16 @@ public:
         memset(&bind_sa, 0, sizeof bind_sa);
         bind_sa.sin_family = AF_INET;
         ASSERT_EQ(inet_pton(AF_INET, "127.0.0.1", &bind_sa.sin_addr), 1);
-        bind_sa.sin_port = htons(5555);
+        // Port 0: the kernel picks a free port, read back after bind.
+        bind_sa.sin_port = 0;
 
         // NOTE: listener callback must be set BEFORE LISTENING,
         // otherwise it may potentially change the procedure in the middle of processing
         // of an incoming connection.
         ASSERT_NE(srt_listen_callback(server_sock, &SrtTestListenCallback, NULL), -1);
         ASSERT_NE(srt_bind(server_sock, (sockaddr*)&bind_sa, sizeof bind_sa), -1);
+        int bind_sa_len = sizeof bind_sa;
+        ASSERT_NE(srt_getsockname(server_sock, (sockaddr*)&bind_sa, &bind_sa_len), -1);
         ASSERT_NE(srt_listen(server_sock, 5), -1);
 
         // Check also changing the listener callback AFTER listening - this is expected to fail.
@@ -70,7 +73,7 @@ public:
         client_sock = srt_create_socket();
         memset(&sa, 0, sizeof sa);
         sa.sin_family = AF_INET;
-        sa.sin_port = htons(5555);
+        sa.sin_port = bind_sa.sin_port;
         ASSERT_EQ(inet_pton(AF_INET, "127.0.0.1", &sa.sin_addr), 1);
         psa = (sockaddr*)&sa;
 

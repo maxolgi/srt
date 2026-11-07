@@ -295,7 +295,7 @@ TEST(TestFEC, Connection)
     sockaddr_in sa;
     memset(&sa, 0, sizeof sa);
     sa.sin_family = AF_INET;
-    sa.sin_port = htons(5555);
+    sa.sin_port = 0; // the kernel picks a free port, read back after the bind
     ASSERT_EQ(inet_pton(AF_INET, "127.0.0.1", &sa.sin_addr), 1);
 
     srt::TestInit srtinit;
@@ -304,6 +304,10 @@ TEST(TestFEC, Connection)
     SRTSOCKET l = srt_create_socket();
 
     srt_bind(l, (sockaddr*)& sa, sizeof(sa));
+    {
+        int sa_len = sizeof sa;
+        srt_getsockname(l, (sockaddr*)& sa, &sa_len);
+    }
 
     const char fec_config1 [] = "fec,cols:10,rows:10";
     const char fec_config2 [] = "fec,cols:10,arq:never";
@@ -354,7 +358,7 @@ TEST(TestFEC, ConnectionReorder)
     sockaddr_in sa;
     memset(&sa, 0, sizeof sa);
     sa.sin_family = AF_INET;
-    sa.sin_port = htons(5555);
+    sa.sin_port = 0; // the kernel picks a free port, read back after the bind
     ASSERT_EQ(inet_pton(AF_INET, "127.0.0.1", &sa.sin_addr), 1);
 
     srt::TestInit srtinit;
@@ -363,6 +367,10 @@ TEST(TestFEC, ConnectionReorder)
     SRTSOCKET l = srt_create_socket();
 
     srt_bind(l, (sockaddr*)& sa, sizeof(sa));
+    {
+        int sa_len = sizeof sa;
+        srt_getsockname(l, (sockaddr*)& sa, &sa_len);
+    }
 
     const char fec_config1 [] = "fec,cols:10,rows:10";
     const char fec_config2 [] = "fec,rows:10,cols:10";
@@ -413,7 +421,7 @@ TEST(TestFEC, ConnectionFull1)
     sockaddr_in sa;
     memset(&sa, 0, sizeof sa);
     sa.sin_family = AF_INET;
-    sa.sin_port = htons(5555);
+    sa.sin_port = 0; // the kernel picks a free port, read back after the bind
     ASSERT_EQ(inet_pton(AF_INET, "127.0.0.1", &sa.sin_addr), 1);
 
     srt::TestInit srtinit;
@@ -422,6 +430,10 @@ TEST(TestFEC, ConnectionFull1)
     SRTSOCKET l = srt_create_socket();
 
     srt_bind(l, (sockaddr*)& sa, sizeof(sa));
+    {
+        int sa_len = sizeof sa;
+        srt_getsockname(l, (sockaddr*)& sa, &sa_len);
+    }
 
     const char fec_config1 [] = "fec,cols:10,rows:20,arq:never,layout:even";
     const char fec_config2 [] = "fec,layout:even,rows:20,cols:10,arq:never";
@@ -468,7 +480,7 @@ TEST(TestFEC, ConnectionFull2)
     sockaddr_in sa;
     memset(&sa, 0, sizeof sa);
     sa.sin_family = AF_INET;
-    sa.sin_port = htons(5555);
+    sa.sin_port = 0; // the kernel picks a free port, read back after the bind
     ASSERT_EQ(inet_pton(AF_INET, "127.0.0.1", &sa.sin_addr), 1);
 
     srt::TestInit srtinit;
@@ -477,6 +489,10 @@ TEST(TestFEC, ConnectionFull2)
     SRTSOCKET l = srt_create_socket();
 
     srt_bind(l, (sockaddr*)& sa, sizeof(sa));
+    {
+        int sa_len = sizeof sa;
+        srt_getsockname(l, (sockaddr*)& sa, &sa_len);
+    }
 
     const char fec_config1 [] = "fec,cols:10,rows:20,arq:always,layout:even";
     const char fec_config2 [] = "fec,layout:even,rows:20,cols:10,arq:always";
@@ -524,7 +540,7 @@ TEST(TestFEC, ConnectionMess)
     sockaddr_in sa;
     memset(&sa, 0, sizeof sa);
     sa.sin_family = AF_INET;
-    sa.sin_port = htons(5555);
+    sa.sin_port = 0; // the kernel picks a free port, read back after the bind
     ASSERT_EQ(inet_pton(AF_INET, "127.0.0.1", &sa.sin_addr), 1);
 
     srt::TestInit srtinit;
@@ -533,6 +549,10 @@ TEST(TestFEC, ConnectionMess)
     SRTSOCKET l = srt_create_socket();
 
     srt_bind(l, (sockaddr*)& sa, sizeof(sa));
+    {
+        int sa_len = sizeof sa;
+        srt_getsockname(l, (sockaddr*)& sa, &sa_len);
+    }
 
     const char fec_config1 [] = "fec,cols:,cols:10";
     const char fec_config2 [] = "fec,cols:,rows:10";
@@ -580,7 +600,7 @@ TEST(TestFEC, ConnectionForced)
     sockaddr_in sa;
     memset(&sa, 0, sizeof sa);
     sa.sin_family = AF_INET;
-    sa.sin_port = htons(5555);
+    sa.sin_port = 0; // the kernel picks a free port, read back after the bind
     ASSERT_EQ(inet_pton(AF_INET, "127.0.0.1", &sa.sin_addr), 1);
 
     srt::TestInit srtinit;
@@ -589,6 +609,10 @@ TEST(TestFEC, ConnectionForced)
     SRTSOCKET l = srt_create_socket();
 
     srt_bind(l, (sockaddr*)& sa, sizeof(sa));
+    {
+        int sa_len = sizeof sa;
+        srt_getsockname(l, (sockaddr*)& sa, &sa_len);
+    }
 
     const char fec_config1 [] = "fec,rows:20,cols:20";
     const char fec_config_final [] = "fec,cols:20,rows:20";
@@ -630,7 +654,7 @@ TEST(TestFEC, RejectionConflict)
     sockaddr_in sa;
     memset(&sa, 0, sizeof sa);
     sa.sin_family = AF_INET;
-    sa.sin_port = htons(5555);
+    sa.sin_port = 0; // the kernel picks a free port, read back after the bind
     ASSERT_EQ(inet_pton(AF_INET, "127.0.0.1", &sa.sin_addr), 1);
 
     srt::TestInit srtinit;
@@ -639,6 +663,10 @@ TEST(TestFEC, RejectionConflict)
     SRTSOCKET l = srt_create_socket();
 
     srt_bind(l, (sockaddr*)& sa, sizeof(sa));
+    {
+        int sa_len = sizeof sa;
+        srt_getsockname(l, (sockaddr*)& sa, &sa_len);
+    }
 
     const char fec_config1 [] = "fec,cols:10,rows:10";
     const char fec_config2 [] = "fec,cols:20,arq:never";
@@ -675,7 +703,7 @@ TEST(TestFEC, RejectionIncompleteEmpty)
     sockaddr_in sa;
     memset(&sa, 0, sizeof sa);
     sa.sin_family = AF_INET;
-    sa.sin_port = htons(5555);
+    sa.sin_port = 0; // the kernel picks a free port, read back after the bind
     ASSERT_EQ(inet_pton(AF_INET, "127.0.0.1", &sa.sin_addr), 1);
 
     srt::TestInit srtinit;
@@ -684,6 +712,10 @@ TEST(TestFEC, RejectionIncompleteEmpty)
     SRTSOCKET l = srt_create_socket();
 
     srt_bind(l, (sockaddr*)& sa, sizeof(sa));
+    {
+        int sa_len = sizeof sa;
+        srt_getsockname(l, (sockaddr*)& sa, &sa_len);
+    }
 
     const char fec_config1 [] = "fec,rows:10";
     srt_setsockflag(s, SRTO_PACKETFILTER, fec_config1, (sizeof fec_config1)-1);
@@ -718,7 +750,7 @@ TEST(TestFEC, RejectionIncomplete)
     sockaddr_in sa;
     memset(&sa, 0, sizeof sa);
     sa.sin_family = AF_INET;
-    sa.sin_port = htons(5555);
+    sa.sin_port = 0; // the kernel picks a free port, read back after the bind
     ASSERT_EQ(inet_pton(AF_INET, "127.0.0.1", &sa.sin_addr), 1);
 
     srt::TestInit srtinit;
@@ -727,6 +759,10 @@ TEST(TestFEC, RejectionIncomplete)
     SRTSOCKET l = srt_create_socket();
 
     srt_bind(l, (sockaddr*)& sa, sizeof(sa));
+    {
+        int sa_len = sizeof sa;
+        srt_getsockname(l, (sockaddr*)& sa, &sa_len);
+    }
 
     const char fec_config1 [] = "fec,rows:10";
     const char fec_config2 [] = "fec,arq:never";
@@ -1114,7 +1150,7 @@ TEST(TestFECGCM, ConnectionReducesPayloadSize)
     sockaddr_in sa;
     memset(&sa, 0, sizeof sa);
     sa.sin_family = AF_INET;
-    sa.sin_port   = htons(5555);
+    sa.sin_port   = 0; // the kernel picks a free port, read back after the bind
     ASSERT_EQ(inet_pton(AF_INET, "127.0.0.1", &sa.sin_addr), 1);
 
     srt::TestInit srtinit;
@@ -1139,6 +1175,10 @@ TEST(TestFECGCM, ConnectionReducesPayloadSize)
     ASSERT_NE(srt_setsockflag(s, SRTO_PAYLOADSIZE, &caller_payload, sizeof caller_payload), SRT_ERROR);
 
     ASSERT_NE(srt_bind(l, (sockaddr*)&sa, sizeof sa), SRT_ERROR);
+    {
+        int sa_len = sizeof sa;
+        ASSERT_EQ(srt_getsockname(l, (sockaddr*)&sa, &sa_len), 0);
+    }
     ASSERT_NE(srt_listen(l, 1), SRT_ERROR);
 
     auto connect_res = spawn_connect(s, sa);
@@ -1190,7 +1230,7 @@ TEST(TestFECGCM, IPv6ConnectionReducesPayloadSize)
     sockaddr_in6 sa;
     memset(&sa, 0, sizeof sa);
     sa.sin6_family = AF_INET6;
-    sa.sin6_port   = htons(5555);
+    sa.sin6_port  = 0; // the kernel picks a free port, read back after the bind
     ASSERT_EQ(inet_pton(AF_INET6, "::1", &sa.sin6_addr), 1);
 
     SRTSOCKET s = srt_create_socket();
@@ -1214,6 +1254,10 @@ TEST(TestFECGCM, IPv6ConnectionReducesPayloadSize)
     ASSERT_NE(srt_setsockflag(s, SRTO_PAYLOADSIZE, &caller_payload, sizeof caller_payload), SRT_ERROR);
 
     ASSERT_NE(srt_bind(l, (sockaddr*)&sa, sizeof sa), SRT_ERROR);
+    {
+        int sa_len = sizeof sa;
+        ASSERT_EQ(srt_getsockname(l, (sockaddr*)&sa, &sa_len), 0);
+    }
     ASSERT_NE(srt_listen(l, 1), SRT_ERROR);
 
     auto connect_res = std::async(std::launch::async, [s, &sa]() {

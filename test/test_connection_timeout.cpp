@@ -43,22 +43,26 @@ protected:
         m_udp_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
         ASSERT_NE(m_udp_sock, -1);
 
-        // Find unused a port not used by any other service.
-        // Otherwise srt_connect may actually connect.
+        // Reserve a port on a raw UDP socket so that nothing ever listens
+        // on it and srt_connect must time out. Binding port 0 lets the
+        // kernel pick a free one, so parallel test processes never collide.
         int bind_res = -1;
+        m_sa.sin_port = 0;
         const sockaddr* psa = reinterpret_cast<const sockaddr*>(&m_sa);
-        for (int port = 5000; port <= 5555; ++port)
+        bind_res = ::bind(m_udp_sock, psa, sizeof m_sa);
+        ASSERT_GE(bind_res, 0);
+
         {
-            m_sa.sin_port = htons(port);
-            bind_res = ::bind(m_udp_sock, psa, sizeof m_sa);
-            if (bind_res >= 0)
-            {
-                cerr << "Running test on port " << port << "\n";
-                break;
-            }
+#ifdef _WIN32
+            // MSVC's winsock has no socklen_t.
+            int sa_len = sizeof m_sa;
+#else
+            socklen_t sa_len = sizeof m_sa;
+#endif
+            ASSERT_EQ(getsockname(m_udp_sock, (sockaddr*)&m_sa, &sa_len), 0);
+            cerr << "Running test on port " << ntohs(m_sa.sin_port) << "\n";
         }
 
-        ASSERT_GE(bind_res, 0);
         ASSERT_EQ(inet_pton(AF_INET, "127.0.0.1", &m_sa.sin_addr), 1);
     }
 
@@ -376,12 +380,13 @@ TEST(TestConnectionAPI, Accept)
     const int ev_acp = SRT_EPOLL_IN | SRT_EPOLL_ERR;
     srt_epoll_add_usock(eidl, listener_sock, &ev_acp);
 
-    sockaddr_any sa = srt::CreateAddr("localhost", 5555, AF_INET);
+    sockaddr_any sa = srt::CreateAddr("localhost", 0, AF_INET);
 
     ASSERT_NE(srt_bind(listener_sock, sa.get(), sa.size()), -1);
+    ASSERT_EQ(srt_getsockname(listener_sock, sa.get(), &sa.len), 0);
     ASSERT_NE(srt_listen(listener_sock, 1), -1);
 
-    cout << "Listen: port 5555 socket @" << listener_sock << endl;
+    cout << "Listen: port " << sa.hport() << " socket @" << listener_sock << endl;
 
     // Set non-blocking mode so that you can wait for readiness
     bool no = false;
@@ -451,9 +456,10 @@ TEST(TestConnectionAPI, Listen)
     SRTSOCKET s = srt_create_socket();
     int listen_stat1, listen_stat2, listen_stat3;
 
-    sockaddr_any sa = srt::CreateAddr("localhost", 5555, AF_INET);
+    sockaddr_any sa = srt::CreateAddr("localhost", 0, AF_INET);
 
     ASSERT_NE(srt_bind(s, sa.get(), sa.size()), -1);
+    ASSERT_EQ(srt_getsockname(s, sa.get(), &sa.len), 0);
     listen_stat1 = srt_listen(s, 1);
     listen_stat2 = srt_listen(s, 5);
     srt_close(s);
@@ -483,9 +489,10 @@ TEST(TestConnectionAPI, AcceptBondCloseListener)
     const int ev_acp = SRT_EPOLL_IN | SRT_EPOLL_ERR;
     srt_epoll_add_usock(eidl, listener_sock, &ev_acp);
 
-    sockaddr_any sa = srt::CreateAddr("localhost", 5555, AF_INET);
+    sockaddr_any sa = srt::CreateAddr("localhost", 0, AF_INET);
 
     ASSERT_NE(srt_bind(listener_sock, sa.get(), sa.size()), -1);
+    ASSERT_EQ(srt_getsockname(listener_sock, sa.get(), &sa.len), 0);
     ASSERT_NE(srt_listen(listener_sock, 1), -1);
 
     // Set non-blocking mode so that you can wait for readiness

@@ -93,7 +93,7 @@ protected:
     SRTSOCKET m_listener_sock_ipv6;
     int m_client_pollid = SRT_ERROR;
     int m_server_pollid = SRT_ERROR;
-    const int m_listen_port = 4200;
+    int m_listen_port = 0; // filled from the port the kernel picks for the IPv4 listener
 };
 
 
@@ -114,7 +114,7 @@ TEST_F(TestMuxer, IPv4_and_IPv6)
     int epoll_in = SRT_EPOLL_IN;
     srt_epoll_add_usock(m_server_pollid, m_listener_sock_ipv4, &epoll_in);
 
-    // 3. Bind to IPv4 address.
+    // 3. Bind to IPv4 address; port 0 makes the kernel pick a free one.
     sockaddr_in sa;
     memset(&sa, 0, sizeof sa);
     sa.sin_family = AF_INET;
@@ -122,6 +122,11 @@ TEST_F(TestMuxer, IPv4_and_IPv6)
     ASSERT_EQ(inet_pton(AF_INET, "127.0.0.1", &sa.sin_addr), 1);
     ASSERT_NE(srt_bind(m_listener_sock_ipv4, (sockaddr*)&sa, sizeof sa), SRT_ERROR);
     ASSERT_NE(srt_listen(m_listener_sock_ipv4, SOMAXCONN), SRT_ERROR);
+    {
+        int sa_len = sizeof sa;
+        ASSERT_EQ(srt_getsockname(m_listener_sock_ipv4, (sockaddr*)&sa, &sa_len), 0);
+        m_listen_port = ntohs(sa.sin_port);
+    }
 
     // 4. Create IPv6 socket bound to the same port as IPv4 socket
     m_listener_sock_ipv6 = srt_create_socket();

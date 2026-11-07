@@ -13,7 +13,6 @@ using namespace std;
 using namespace srt;
 using namespace hvu;
 
-#define TEST_UDP_PORT 9990
 
 TEST(CEPoll, InfiniteWait)
 {
@@ -278,7 +277,7 @@ TEST(CEPoll, NotifyConnectionBreak)
     sockaddr_in sa_client;
     memset(&sa_client, 0, sizeof sa_client);
     sa_client.sin_family = AF_INET;
-    sa_client.sin_port = htons(5555);
+    sa_client.sin_port = 0; // filled from the listener's port after bind
     ASSERT_EQ(inet_pton(AF_INET, "127.0.0.1", &sa_client.sin_addr), 1);
 
     // 2. Prepare server
@@ -297,10 +296,16 @@ TEST(CEPoll, NotifyConnectionBreak)
     sockaddr_in sa;
     memset(&sa, 0, sizeof sa);
     sa.sin_family = AF_INET;
-    sa.sin_port = htons(5555);
+    sa.sin_port = 0; // the kernel picks a free port, read back after bind
     ASSERT_EQ(inet_pton(AF_INET, "127.0.0.1", &sa.sin_addr), 1);
 
     srt_bind(server_sock, (sockaddr*)& sa, sizeof(sa));
+    {
+        // Pick up the port the kernel has chosen so that parallel tests never collide.
+        int sa_len = sizeof sa;
+        srt_getsockname(server_sock, (sockaddr*)&sa, &sa_len);
+        sa_client.sin_port = sa.sin_port;
+    }
     srt_listen(server_sock, 1);
 
 
@@ -554,7 +559,7 @@ void testListenerReady(const bool LATE_CALL, size_t nmembers)
     sockaddr_in sa;
     memset(&sa, 0, sizeof sa);
     sa.sin_family = AF_INET;
-    sa.sin_port = htons(5555);
+    sa.sin_port = 0; // the kernel picks a free port, read back after bind
     ASSERT_EQ(inet_pton(AF_INET, "127.0.0.1", &sa.sin_addr), 1);
 
     TestInit init;
@@ -576,6 +581,11 @@ void testListenerReady(const bool LATE_CALL, size_t nmembers)
     }
 
     srt_bind(server_sock, (sockaddr*)& sa, sizeof(sa));
+    {
+        // Pick up the port the kernel has chosen so that parallel tests never collide.
+        int sa_len = sizeof sa;
+        ASSERT_EQ(srt_getsockname(server_sock, (sockaddr*)&sa, &sa_len), 0);
+    }
     srt_listen(server_sock, nmembers+1);
 
     srt::setopt(server_sock)[SRTO_RCVSYN] = false;
@@ -779,13 +789,13 @@ void testMultipleListenerReady(const bool LATE_CALL)
     sockaddr_in sa;
     memset(&sa, 0, sizeof sa);
     sa.sin_family = AF_INET;
-    sa.sin_port = htons(5555);
+    sa.sin_port = 0; // the kernel picks a free port, read back after bind
     ASSERT_EQ(inet_pton(AF_INET, "127.0.0.1", &sa.sin_addr), 1);
 
     sockaddr_in sa2;
     memset(&sa2, 0, sizeof sa2);
     sa2.sin_family = AF_INET;
-    sa2.sin_port = htons(5556);
+    sa2.sin_port = 0; // the kernel picks a free port, read back after bind
     ASSERT_EQ(inet_pton(AF_INET, "127.0.0.1", &sa2.sin_addr), 1);
 
     TestInit init;
@@ -804,6 +814,13 @@ void testMultipleListenerReady(const bool LATE_CALL)
     srt::setopt(server_sock)[SRTO_RCVSYN] = false;
 
     srt_bind(server_sock2, (sockaddr*)& sa2, sizeof(sa2));
+    {
+        // Pick up the ports the kernel has chosen so that parallel tests never collide.
+        int sa_len = sizeof sa;
+        ASSERT_EQ(srt_getsockname(server_sock, (sockaddr*)&sa, &sa_len), 0);
+        sa_len = sizeof sa2;
+        ASSERT_EQ(srt_getsockname(server_sock2, (sockaddr*)&sa2, &sa_len), 0);
+    }
     srt_listen(server_sock2, 3);
     srt::setopt(server_sock2)[SRTO_RCVSYN] = false;
 
@@ -955,6 +972,8 @@ class TestEPoll: public srt::Test
 protected:
 
     int m_client_pollid = int(SRT_ERROR);
+    // Port the kernel picked for the server listener; 0 until createServerSocket binds.
+    int m_listen_port = 0;
     SRTSOCKET m_client_sock = SRT_INVALID_SOCK;
 
     void clientSocket()
@@ -976,10 +995,8 @@ protected:
         sockaddr_in sa;
         memset(&sa, 0, sizeof sa);
         sa.sin_family = AF_INET;
-        sa.sin_port = htons(TEST_UDP_PORT);
-
+        sa.sin_port = htons(m_listen_port);
         ASSERT_EQ(inet_pton(AF_INET, "127.0.0.1", &sa.sin_addr), 1);
-
         sockaddr* psa = (sockaddr*)&sa;
 
         ASSERT_NE(srt_connect(m_client_sock, psa, sizeof sa), SRT_INVALID_SOCK);
@@ -1050,12 +1067,19 @@ protected:
         sockaddr_in sa;
         memset(&sa, 0, sizeof sa);
         sa.sin_family = AF_INET;
-        sa.sin_port = htons(TEST_UDP_PORT);
+        // Port 0 makes the kernel pick a free one; the chosen port is
+        // read back into m_listen_port for the client side to connect to.
+        sa.sin_port = 0;
         sa.sin_addr.s_addr = INADDR_ANY;
         sockaddr* psa = (sockaddr*)&sa;
 
         ASSERT_NE(srt_bind(servsock, psa, sizeof sa), SRT_ERROR);
         ASSERT_NE(srt_listen(servsock, SOMAXCONN), SRT_ERROR);
+        {
+            int sa_len = sizeof sa;
+            ASSERT_EQ(srt_getsockname(servsock, psa, &sa_len), 0);
+            m_listen_port = ntohs(sa.sin_port);
+        }
 
         w_servsock = servsock;
     }

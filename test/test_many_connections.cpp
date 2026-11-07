@@ -54,22 +54,16 @@ protected:
         m_server_sock = srt_create_socket();
         ASSERT_NE(m_server_sock, SRT_INVALID_SOCK);
 
-        // Find a port not used by another service.
-        int bind_res = 0;
+        // Bind to port 0 and let the kernel pick a free port, so that
+        // parallel test processes never collide.
+        m_sa.sin_port = 0;
         const sockaddr* psa = reinterpret_cast<const sockaddr*>(&m_sa);
-        for (int port = 5000; port <= 5100; ++port)
-        {
-            m_sa.sin_port = htons(port);
-
-            bind_res = srt_bind(m_server_sock, psa, sizeof m_sa);
-            if (bind_res == 0)
-            {
-                cerr << "Running test on port " << port << "\n";
-                break;
-            }
-        }
-
+        int bind_res = srt_bind(m_server_sock, psa, sizeof m_sa);
         ASSERT_GE(bind_res, 0) << "srt_bind returned " << bind_res << ": " << srt_getlasterror_str();
+        {
+            int sa_len = sizeof m_sa;
+            ASSERT_EQ(srt_getsockname(m_server_sock, (sockaddr*)&m_sa, &sa_len), 0);
+        }
         ASSERT_EQ(inet_pton(AF_INET, "127.0.0.1", &m_sa.sin_addr), 1);
 
         // Fill the buffer with random data

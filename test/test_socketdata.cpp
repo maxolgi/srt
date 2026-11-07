@@ -31,9 +31,11 @@ TEST(SocketData, PeerName)
     srt_setsockflag(csock, SRTO_RCVSYN, &rd_nonblocking, sizeof (rd_nonblocking));
     //srt_setsockflag(lsock, SRTO_RCVSYN, &rd_nonblocking, sizeof (rd_nonblocking));
 
-    sockaddr_any addr = srt::CreateAddr("127.0.0.1", 5000, AF_INET);
+    sockaddr_any addr = srt::CreateAddr("127.0.0.1", 0, AF_INET);
 
     ASSERT_NE(srt_bind(lsock, addr.get(), addr.size()), -1);
+    // Pick up the port the kernel has chosen so that parallel tests never collide.
+    ASSERT_NE(srt_getsockname(lsock, addr.get(), &addr.len), -1);
 
     ASSERT_NE(srt_listen(lsock, 5), -1);
 
@@ -100,9 +102,11 @@ TEST(SocketData, CheckDragAccept)
     MAKE_UNIQUE_SOCK(listener, "listener", srt_create_socket());
 
 
-    sockaddr_any sa = srt::CreateAddr("127.0.0.1", 5000, AF_INET);
+    sockaddr_any sa = srt::CreateAddr("127.0.0.1", 0, AF_INET);
 
     srt_bind(listener, sa.get(), sa.size());
+    // Pick up the port the kernel has chosen so that parallel tests never collide.
+    srt_getsockname(listener, sa.get(), &sa.len);
     srt_listen(listener, 1);
 
     SRTSOCKET caller = srt_create_socket();
@@ -177,9 +181,11 @@ TEST(SocketData, CheckDragCaller)
 
     MAKE_UNIQUE_SOCK(listener, "listener", srt_create_socket());
 
-    sockaddr_any sa = srt::CreateAddr("127.0.0.1", 5000, AF_INET);
+    sockaddr_any sa = srt::CreateAddr("127.0.0.1", 0, AF_INET);
 
     EXPECT_NE(srt_bind(listener, sa.get(), sa.size()), SRT_ERROR);
+    // Pick up the port the kernel has chosen so that parallel tests never collide.
+    EXPECT_NE(srt_getsockname(listener, sa.get(), &sa.len), SRT_ERROR);
     EXPECT_NE(srt_listen(listener, 1), SRT_ERROR);
 
     SRTSOCKET caller = srt_create_socket();

@@ -10,6 +10,13 @@
 #include "common.h"
 #include "srt.h"
 
+#ifdef _WIN32
+#include <winsock2.h>
+#else
+#include <arpa/inet.h>
+#include <unistd.h>
+#endif
+
 using srt::sockaddr_any;
 
 template<typename Future>
@@ -219,6 +226,36 @@ protected:
         }
 
         cout << "[T/C] Client exit\n";
+    }
+
+    // Picks a free UDP port number for the SRT sockets of one test to bind:
+    // binds port 0 on a short-lived raw UDP socket and reads the chosen
+    // number back. The SRT bind that immediately follows reuses the number,
+    // so parallel test processes never collide on a shared fixed port.
+    static int PickPortNumber()
+    {
+        const int fd = socket(AF_INET, SOCK_DGRAM, 0);
+        EXPECT_NE(fd, -1);
+        sockaddr_in sa;
+        memset(&sa, 0, sizeof sa);
+        sa.sin_family = AF_INET;
+        sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        sa.sin_port = 0;
+        EXPECT_EQ(::bind(fd, (sockaddr*)&sa, sizeof sa), 0);
+#ifdef _WIN32
+        // MSVC's winsock has no socklen_t.
+        int len = sizeof sa;
+#else
+        socklen_t len = sizeof sa;
+#endif
+        EXPECT_EQ(getsockname(fd, (sockaddr*)&sa, &len), 0);
+        const int port = ntohs(sa.sin_port);
+#ifdef _WIN32
+        closesocket(fd);
+#else
+        close(fd);
+#endif
+        return port;
     }
 
     SRTSOCKET prepareServerSocket()
@@ -503,10 +540,12 @@ private:
 TEST_F(ReuseAddr, SameAddr1)
 {
 
-    SRTSOCKET bindsock_1 = createBinder("127.0.0.1", 5000, true);
-    SRTSOCKET bindsock_2 = createListener("127.0.0.1", 5000, true);
+    const int port = PickPortNumber();
 
-    testAccept(bindsock_2, "127.0.0.1", 5000, true);
+    SRTSOCKET bindsock_1 = createBinder("127.0.0.1", port, true);
+    SRTSOCKET bindsock_2 = createListener("127.0.0.1", port, true);
+
+    testAccept(bindsock_2, "127.0.0.1", port, true);
 
     shutdownListeners({bindsock_1, bindsock_2});
 
@@ -514,42 +553,46 @@ TEST_F(ReuseAddr, SameAddr1)
 
 TEST_F(ReuseAddr, SameAddr2)
 {
+
+    const int port = PickPortNumber();
     std::string localip = GetLocalIP(AF_INET);
     if (localip == "")
         return; // DISABLE TEST if this doesn't work.
 
-    SRTSOCKET bindsock_1 = createBinder(localip, 5000, true);
-    SRTSOCKET bindsock_2 = createListener(localip, 5000, true);
+    SRTSOCKET bindsock_1 = createBinder(localip, port, true);
+    SRTSOCKET bindsock_2 = createListener(localip, port, true);
 
-    testAccept(bindsock_2, localip, 5000, true);
+    testAccept(bindsock_2, localip, port, true);
 
     shutdownListener(bindsock_1);
 
     // Test simple close and reuse the multiplexer
     ASSERT_NE(srt_close(bindsock_2), SRT_ERROR);
 
-    SRTSOCKET bindsock_3 = createListener(localip, 5000, true);
-    testAccept(bindsock_3, localip, 5000, true);
+    SRTSOCKET bindsock_3 = createListener(localip, port, true);
+    testAccept(bindsock_3, localip, port, true);
 
     shutdownListener(bindsock_3);
 }
 
 TEST_F(ReuseAddr, SameAddrV6)
 {
+
+    const int port = PickPortNumber();
     SRTST_REQUIRES(IPv6);
 
-    SRTSOCKET bindsock_1 = createBinder("::1", 5000, true);
-    SRTSOCKET bindsock_2 = createListener("::1", 5000, true);
+    SRTSOCKET bindsock_1 = createBinder("::1", port, true);
+    SRTSOCKET bindsock_2 = createListener("::1", port, true);
 
-    testAccept(bindsock_2, "::1", 5000, true);
+    testAccept(bindsock_2, "::1", port, true);
 
     shutdownListener(bindsock_1);
 
     // Test simple close and reuse the multiplexer
     ASSERT_NE(srt_close(bindsock_2), SRT_ERROR);
 
-    SRTSOCKET bindsock_3 = createListener("::1", 5000, true);
-    testAccept(bindsock_3, "::1", 5000, true);
+    SRTSOCKET bindsock_3 = createListener("::1", port, true);
+    testAccept(bindsock_3, "::1", port, true);
 
     shutdownListener(bindsock_3);
 }
@@ -557,23 +600,28 @@ TEST_F(ReuseAddr, SameAddrV6)
 
 TEST_F(ReuseAddr, DiffAddr)
 {
+
+    const int port = PickPortNumber();
     std::string localip = GetLocalIP(AF_INET);
     if (localip == "")
         return; // DISABLE TEST if this doesn't work.
 
-    SRTSOCKET bindsock_1 = createBinder("127.0.0.1", 5000, true);
-    SRTSOCKET bindsock_2 = createListener(localip, 5000, true);
+    SRTSOCKET bindsock_1 = createBinder("127.0.0.1", port, true);
+    SRTSOCKET bindsock_2 = createListener(localip, port, true);
 
-    //std::thread server_1(testAccept, bindsock_1, "127.0.0.1", 5000, true);
+    //std::thread server_1(testAccept, bindsock_1, "127.0.0.1", port, true);
     //server_1.join();
 
-    testAccept(bindsock_2, localip, 5000, true);
+    testAccept(bindsock_2, localip, port, true);
 
     shutdownListeners({bindsock_1, bindsock_2});
 }
 
 TEST_F(ReuseAddr, UDPOptions)
 {
+
+    const int port1 = PickPortNumber();
+    const int port2 = PickPortNumber();
     // IP_TOS and IP_TTL don't work on Windows and Mac
     SRTST_REQUIRES(Platform, "Linux", "GNU");
 
@@ -591,14 +639,16 @@ TEST_F(ReuseAddr, UDPOptions)
     EXPECT_NE(srt_setsockflag(bs2, SRTO_IPTOS, &val_TOS, sizeof val_TOS), SRT_ERROR);
     EXPECT_NE(srt_setsockflag(bs2, SRTO_IPTTL, &val_TTL, sizeof val_TTL), SRT_ERROR);
 
-    bindSocket(bs1, "::1", 5000, true);
-    bindSocket(bs2, "::FFFF:127.0.0.1", 5001, true);
+    bindSocket(bs1, "::1", port1, true);
+    bindSocket(bs2, "::FFFF:127.0.0.1", port2, true);
 
     std::cout << "Sockets at the end: @" << bs1 << " @" << bs2 << std::endl;
 }
 
 TEST_F(ReuseAddr, Wildcard)
 {
+
+    const int port = PickPortNumber();
 #if defined(_WIN32) || defined(CYGWIN)
     std::cout << "!!!WARNING!!!: On Windows connection to localhost this way isn't possible.\n"
         "Forcing test to pass, PLEASE FIX.\n";
@@ -610,18 +660,20 @@ TEST_F(ReuseAddr, Wildcard)
     std::string localip = GetLocalIP(AF_INET);
     if (localip == "")
         return; // DISABLE TEST if this doesn't work.
-    SRTSOCKET bindsock_1 = createListener("0.0.0.0", 5000, true);
+    SRTSOCKET bindsock_1 = createListener("0.0.0.0", port, true);
 
     // Binding a certain address when wildcard is already bound should fail.
-    SRTSOCKET bindsock_2 = createBinder(localip, 5000, false);
+    SRTSOCKET bindsock_2 = createBinder(localip, port, false);
 
-    testAccept(bindsock_1, "127.0.0.1", 5000, true);
+    testAccept(bindsock_1, "127.0.0.1", port, true);
 
     shutdownListeners({bindsock_1, bindsock_2});
 }
 
 TEST_F(ReuseAddr, Wildcard6)
 {
+
+    const int port = PickPortNumber();
     SRTST_REQUIRES(IPv6);
 #if defined(_WIN32) || defined(CYGWIN)
     std::cout << "!!!WARNING!!!: On Windows connection to localhost this way isn't possible.\n"
@@ -648,19 +700,19 @@ TEST_F(ReuseAddr, Wildcard6)
 
     SRTSOCKET bindsock_1 = prepareServerSocket();
     srt_setsockflag(bindsock_1, SRTO_IPV6ONLY, &strict_ipv6, sizeof strict_ipv6);
-    bindListener(bindsock_1, "::", 5000, true);
+    bindListener(bindsock_1, "::", port, true);
 
     // Binding a certain address when wildcard is already bound should fail.
-    SRTSOCKET bindsock_2 = createBinder(localip, 5000, false);
+    SRTSOCKET bindsock_2 = createBinder(localip, port, false);
 
     SRTSOCKET bindsock_3 = SRT_INVALID_SOCK;
     if (localip_v4 != "")
     {
         // V6ONLY = 1, which means that binding to IPv4 should be possible.
-        bindsock_3 = createBinder(localip_v4, 5000, true);
+        bindsock_3 = createBinder(localip_v4, port, true);
     }
 
-    testAccept(bindsock_1, "::1", 5000, true);
+    testAccept(bindsock_1, "::1", port, true);
 
     shutdownListeners({bindsock_1, bindsock_2, bindsock_3});
 
@@ -670,25 +722,27 @@ TEST_F(ReuseAddr, Wildcard6)
 
     bindsock_1 = prepareServerSocket();
     srt_setsockflag(bindsock_1, SRTO_IPV6ONLY, &strict_ipv6, sizeof strict_ipv6);
-    bindListener(bindsock_1, "::", 5000, true);
+    bindListener(bindsock_1, "::", port, true);
 
     // Binding a certain address when wildcard is already bound should fail.
-    bindsock_2 = createBinder(localip, 5000, false);
+    bindsock_2 = createBinder(localip, port, false);
     bindsock_3 = SRT_INVALID_SOCK;
 
     if (localip_v4 != "")
     {
         // V6ONLY = 0, which means that binding to IPv4 should not be possible.
-        bindsock_3 = createBinder(localip_v4, 5000, false);
+        bindsock_3 = createBinder(localip_v4, port, false);
     }
 
-    testAccept(bindsock_1, "::1", 5000, true);
+    testAccept(bindsock_1, "::1", port, true);
 
     shutdownListeners({bindsock_1, bindsock_2, bindsock_3});
 }
 
 TEST_F(ReuseAddr, ProtocolVersion6)
 {
+
+    const int port = PickPortNumber();
     SRTST_REQUIRES(IPv6);
 
 #if defined(_WIN32) || defined(CYGWIN)
@@ -697,7 +751,7 @@ TEST_F(ReuseAddr, ProtocolVersion6)
     return;
 #endif
 
-    SRTSOCKET bindsock_1 = createListener("0.0.0.0", 5000, true);
+    SRTSOCKET bindsock_1 = createListener("0.0.0.0", port, true);
 
     // We need a small interception in this one.
     // createListener = prepareServerSocket | bindListener
@@ -706,17 +760,19 @@ TEST_F(ReuseAddr, ProtocolVersion6)
         int yes = 1;
 
         ASSERT_NE(srt_setsockflag(bindsock_2, SRTO_IPV6ONLY, &yes, sizeof yes), SRT_ERROR);
-        ASSERT_TRUE(bindListener(bindsock_2, "::", 5000, true));
+        ASSERT_TRUE(bindListener(bindsock_2, "::", port, true));
     }
 
-    testAccept(bindsock_1, "127.0.0.1", 5000, true);
-    testAccept(bindsock_2, "::1", 5000, true);
+    testAccept(bindsock_1, "127.0.0.1", port, true);
+    testAccept(bindsock_2, "::1", port, true);
 
     shutdownListeners({bindsock_1, bindsock_2});
 }
 
 TEST_F(ReuseAddr, ProtocolVersionFaux6)
 {
+
+    const int port = PickPortNumber();
     SRTST_REQUIRES(IPv6);
 
 #if defined(_WIN32) || defined(CYGWIN)
@@ -725,7 +781,7 @@ TEST_F(ReuseAddr, ProtocolVersionFaux6)
     return;
 #endif
 
-    SRTSOCKET bindsock_1 = createListener("0.0.0.0", 5000, true);
+    SRTSOCKET bindsock_1 = createListener("0.0.0.0", port, true);
 
     // We need a small interception in this one.
     // createListener = prepareServerSocket | bindListener
@@ -734,16 +790,19 @@ TEST_F(ReuseAddr, ProtocolVersionFaux6)
         int no = 0;
 
         ASSERT_NE(srt_setsockflag(bindsock_2, SRTO_IPV6ONLY, &no, sizeof no), SRT_ERROR);
-        ASSERT_FALSE(bindListener(bindsock_2, "::", 5000, false));
+        ASSERT_FALSE(bindListener(bindsock_2, "::", port, false));
     }
 
-    testAccept(bindsock_1, "127.0.0.1", 5000, true);
+    testAccept(bindsock_1, "127.0.0.1", port, true);
 
     shutdownListeners({bindsock_1, bindsock_2});
 }
 
 TEST_F(ReuseAddr, QuickClose)
 {
+
+    const int port = PickPortNumber();
+    const int port2 = PickPortNumber();
     using namespace std;
 
     srt::TestInit srtinit;
@@ -751,18 +810,18 @@ TEST_F(ReuseAddr, QuickClose)
     UniquePollid server_pollid;
     ASSERT_NE(SRT_ERROR, server_pollid);
 
-    SRTSOCKET bindsock_1 = createBinder("127.0.0.1", 5000, true);
-    SRTSOCKET bindsock_2 = createListener("127.0.0.1", 5000, true);
+    SRTSOCKET bindsock_1 = createBinder("127.0.0.1", port, true);
+    SRTSOCKET bindsock_2 = createListener("127.0.0.1", port, true);
 
     cout << "[1] Test accept with lsn=@" << bindsock_1 << " and another @" << bindsock_2 << endl;
 
-    testAccept(bindsock_2, "127.0.0.1", 5000, true);
+    testAccept(bindsock_2, "127.0.0.1", port, true);
 
     cout << "[1] Shutting down both\n";
     shutdownListeners({bindsock_1, bindsock_2});
 
-    cout << "[2] QUICKLY! Create listener on :5001 before SRT realized what happened...\n";
-    SRTSOCKET endpoint = createListener("127.0.0.1", 5001, true);
+    cout << "[2] QUICKLY! Create listener on :" << port2 << " before SRT realized what happened...\n";
+    SRTSOCKET endpoint = createListener("127.0.0.1", port2, true);
 
     cout << "[3] Running 10x connect-binder-to-listener @" << endpoint << "\n";
 
@@ -787,11 +846,11 @@ TEST_F(ReuseAddr, QuickClose)
         int no = 0;
         EXPECT_NE(srt_setsockflag(next_binder, SRTO_REUSEADDR, &no, sizeof no), SRT_ERROR);
 
-        cout << "[3." << i << "] Binder sock @" << next_binder << " bind to localhost:5000, NO REUSE ADDR\n";
-        bool succeed = bindSocket(next_binder, "127.0.0.1", 5000, true);
+        cout << "[3." << i << "] Binder sock @" << next_binder << " bind to localhost:" << port << ", NO REUSE ADDR\n";
+        bool succeed = bindSocket(next_binder, "127.0.0.1", port, true);
 
-        sockaddr_any endsa = srt::CreateAddr("127.0.0.1", 5001, AF_INET);
-        cout << "[3." << i << "] Binder sock @" << next_binder << " connect to localhost:5001\n";
+        sockaddr_any endsa = srt::CreateAddr("127.0.0.1", port2, AF_INET);
+        cout << "[3." << i << "] Binder sock @" << next_binder << " connect to localhost:" << port2 << "\n";
         EXPECT_NE(srt_connect(next_binder, endsa.get(), endsa.size()), SRT_INVALID_SOCK);
 
         cout << "[3." << i << "] Expect listener @" << endpoint << " accept-ready in E" << server_pollid << "\n";
