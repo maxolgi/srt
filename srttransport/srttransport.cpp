@@ -198,6 +198,18 @@ int SRTTransportQueue::deliver(struct sockaddr* w_src, int* w_srclen, SRT_VTBUF*
         }
     }
 
+    // The datagram must fit into the entries as a whole - check that
+    // before any of them is written, so a rejected datagram never
+    // touches the caller's buffers. One that doesn't fit is discarded -
+    // a UDP socket would report MSG_TRUNC for it and the packet would
+    // be dropped.
+    size_t capacity = 0;
+    for (int i = 0; i < nvec; ++i)
+        capacity += (size_t)(w_vec[i].len > 0 ? w_vec[i].len : 0);
+
+    if (dg.data.size() > capacity)
+        return -1;
+
     // Scatter the datagram over the caller's buffer entries, the header
     // block first, the remainder into the next buffers - the way recvmsg
     // scatters a datagram.
@@ -216,13 +228,6 @@ int SRTTransportQueue::deliver(struct sockaddr* w_src, int* w_srclen, SRT_VTBUF*
             memcpy(w_vec[i].data, dg.data.data() + offset, n);
         offset += n;
         remaining -= n;
-    }
-
-    if (remaining)
-    {
-        // Doesn't fit into the entries - a UDP socket would report
-        // MSG_TRUNC for it and the packet would be dropped.
-        return -1;
     }
 
     if (dg.srclen)
