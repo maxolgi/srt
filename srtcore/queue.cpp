@@ -2260,6 +2260,13 @@ CUDTSocket* CMultiplexer::findPeer(SRTSOCKET rid, const sockaddr_any& remote_add
 
 /// Check if this multiplexer serves a socket that has
 /// the given address recorded as its peer address.
+///
+/// SCOPE: linear in the number of sockets served by THIS multiplexer, run
+/// once per incoming NEW connection request; called only from the
+/// virtual-transport rejection path in CUDT::processConnectRequest, where
+/// each multiplexer serves one binding (the bound socket plus accepted
+/// sockets), so the scan stays small. Do not wire it into a shared UDP
+/// multiplexer's connection path without revisiting the complexity.
 bool CMultiplexer::hasPeerAddr(const sockaddr_any& addr) const
 {
     sync::ScopedLock lk (m_SocketsLock);
