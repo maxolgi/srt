@@ -319,6 +319,20 @@ int DeliverLyingNegative(void* opaq, struct sockaddr* w_src, int* w_srclen, SRT_
     return honest == -1 ? -1 : -7;
 }
 
+// A lying deliver callback for TestVirtualTransport
+// ChannelDropsDatagramWithBogusSourceFamily: like the two above, it calls
+// the queue's honest deliver() and returns the honest size, but overwrites
+// the reported source address family with a value no network stack would
+// ever report.
+int DeliverLyingSourceFamily(void* opaq, struct sockaddr* w_src, int* w_srclen, SRT_VTBUF* w_vec, int nvec)
+{
+    srt::SRTTransportQueue* queue = (srt::SRTTransportQueue*)opaq;
+    const int               honest = queue->deliver(w_src, w_srclen, w_vec, nvec);
+    if (honest != -1)
+        w_src->sa_family = AF_UNSPEC;
+    return honest;
+}
+
 } // namespace
 
 class TestVirtualTransport : public srt::Test
@@ -2042,6 +2056,56 @@ TEST_F(TestVirtualTransport, ChannelBoundsDeliverReportByCapacity)
         EXPECT_EQ(channel.recvfrom(from, packet), srt::RST_AGAIN);
         EXPECT_EQ(packet.getLength(), (size_t)-1) << "a negative report wrapped into a bogus length";
     }
+}
+
+// The source-address twin of the capacity check above: the family in the
+// source address the owner's deliver callback reports may be trusted
+// only as a family SRT can dispatch by. On a UDP socket the kernel
+// enforces this for free - recvmsg() always fills the source address
+// with the valid family of the sender as the network stack saw it - but
+// the owner callback is arbitrary code, so the channel must check the
+// family itself: a bogus one would otherwise flow into the receive
+// queue's per-address dispatch. The lying deliver calls the queue's
+// honest deliver() and returns the honest size, but overwrites the
+// reported source family with AF_UNSPEC; the datagram must be discarded
+// exactly like an oversized one - never handed upstream.
+TEST_F(TestVirtualTransport, ChannelDropsDatagramWithBogusSourceFamily)
+{
+    const sockaddr_in label_addr = FillV4("10.224.0.2", 5555);
+    const sockaddr_in src_addr   = FillV4("10.224.0.1", 5556);
+
+    // One valid SRT datagram in the network byte order the queue
+    // expects, the same shape as in the capacity test above: the queue's
+    // honest deliver must succeed, so that the only lie is the source
+    // family.
+    const size_t       payload_len = 600;
+    std::vector<char>  datagram(srt::CPacket::HDR_SIZE + payload_len);
+    uint32_t*          hdr = (uint32_t*)datagram.data();
+    hdr[0]                = htonl(1);                                        // SEQNO: data, sequence 1
+    hdr[1]                = htonl((uint32_t)srt::PacketBoundaryBits(srt::PB_SOLO) | 1u); // MSGNO: solo, message 1
+    hdr[2]                = htonl(0);                                        // TIMESTAMP
+    hdr[3]                = htonl(2);                                        // destination socket id
+    for (size_t i = 0; i < payload_len; ++i)
+        datagram[srt::CPacket::HDR_SIZE + i] = (char)(i & 0xff);
+
+    srt::SRTTransportQueue queue(&NullSend, NULL);
+    ASSERT_EQ(queue.push(datagram.data(), datagram.size(), (const struct sockaddr*)&src_addr, sizeof src_addr), 0);
+
+    SRT_VirtualTransportConfig cfg = queue.getConfig();
+    cfg.deliver = &DeliverLyingSourceFamily; // the config's opaq stays the queue
+
+    const srt::CChannelVirtual channel(
+        cfg, srt::sockaddr_any((const struct sockaddr*)&label_addr, sizeof label_addr), false);
+
+    srt::CPacket packet;
+    packet.allocate(1500);
+    srt::sockaddr_any from(AF_INET);
+
+    // The datagram is dropped like a truncated one on a UDP socket: the
+    // channel reports nothing received and the packet length is reset,
+    // and the bogus family never leaves the channel.
+    EXPECT_EQ(channel.recvfrom(from, packet), srt::RST_AGAIN);
+    EXPECT_EQ(packet.getLength(), (size_t)-1) << "a datagram with a bogus source family was accepted";
 }
 
 // The contract of SRT_VTWAIT_BROKEN: a waitread() that reports the medium

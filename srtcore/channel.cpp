@@ -1409,6 +1409,21 @@ EReadStatus CChannelVirtual::recvfrom(sockaddr_any& w_addr, CPacket& w_packet) c
         return RST_AGAIN;
     }
 
+    // Sanity check: the source address the owner callback reports must
+    // carry a family SRT can dispatch by. On a UDP socket the kernel
+    // always reports a valid source address family - the sender address
+    // comes from the network stack - but the owner callback is arbitrary
+    // code, so the family must be checked here too: a bogus family would
+    // otherwise flow into the queue's per-address dispatch.
+    if (w_addr.get()->sa_family != AF_INET && w_addr.get()->sa_family != AF_INET6)
+    {
+        HLOGC(krlog.Debug,
+              log << CONID() << "the deliver callback reported source address family "
+                  << (int)w_addr.get()->sa_family << ", neither AF_INET nor AF_INET6 - discarding the datagram");
+        w_packet.setLength(-1);
+        return RST_AGAIN;
+    }
+
     w_packet.setLength(recv_size - CPacket::HDR_SIZE);
     w_packet.toHostByteOrder();
 
