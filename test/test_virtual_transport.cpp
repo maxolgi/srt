@@ -292,6 +292,33 @@ void BindVirtualConclusionFirst(SRTSOCKET sock, const sockaddr_in& label, const 
         << srt_getlasterror_str();
 }
 
+// A send callback for the queues that only ever RECEIVE in the channel
+// test below: nothing is ever sent through them, so every datagram is
+// simply accepted and dropped.
+int NullSend(void* /*opaq*/, const char* /*data*/, int len, const struct sockaddr* /*dst*/, int /*dstlen*/)
+{
+    return len;
+}
+
+// Lying deliver callbacks for TestVirtualTransport
+// ChannelBoundsDeliverReportByCapacity: both call the queue's honest
+// deliver() - so the datagram is really picked up and scattered into the
+// provided buffers - but then report a size those buffers do not carry:
+// one past the provided capacity, and a negative value other than -1.
+int DeliverLyingLarge(void* opaq, struct sockaddr* w_src, int* w_srclen, SRT_VTBUF* w_vec, int nvec)
+{
+    srt::SRTTransportQueue* queue = (srt::SRTTransportQueue*)opaq;
+    const int               honest = queue->deliver(w_src, w_srclen, w_vec, nvec);
+    return honest == -1 ? -1 : honest + 1000;
+}
+
+int DeliverLyingNegative(void* opaq, struct sockaddr* w_src, int* w_srclen, SRT_VTBUF* w_vec, int nvec)
+{
+    srt::SRTTransportQueue* queue = (srt::SRTTransportQueue*)opaq;
+    const int               honest = queue->deliver(w_src, w_srclen, w_vec, nvec);
+    return honest == -1 ? -1 : -7;
+}
+
 } // namespace
 
 class TestVirtualTransport : public srt::Test
@@ -1854,4 +1881,107 @@ TEST_F(TestVirtualTransport, ConnectingStateNeverFalselyBroken)
 
     churn_stop.store(true, std::memory_order_relaxed);
     churn.join();
+}
+
+// The buffer-capacity contract of CChannelVirtual::recvfrom, exercised
+// directly on the channel (a unit test of the channel, not an end-to-end
+// wire test): the size the owner's deliver callback reports may be
+// trusted only as far as the buffers SRT handed it. On a UDP socket the
+// kernel enforces this for free - recvmsg() never writes past the
+// iovecs and reports MSG_TRUNC for a datagram that does not fit, which
+// the UDP path treats as a drop - but the owner callback is arbitrary
+// code, so the channel must enforce the same bound itself: a report
+// beyond the provided capacity would make setLength() plant a length
+// past the payload buffer for downstream SRT to read out of bounds, and
+// a negative report other than -1 wraps around an unsigned lower-bound
+// check into a huge size. Each case runs on a fresh queue+channel with
+// one datagram pushed - datagrams are consumed - and the packet gets the
+// same shape of receive buffer the queue worker provides
+// (CRcvQueue::worker_RetrieveAndProcessUnit sets the payload size on its
+// unit's packet before every recvfrom): a 1500-byte payload buffer.
+TEST_F(TestVirtualTransport, ChannelBoundsDeliverReportByCapacity)
+{
+    const sockaddr_in label_addr = FillV4("10.224.0.2", 5555);
+    const sockaddr_in src_addr   = FillV4("10.224.0.1", 5556);
+
+    // One valid SRT datagram in the network byte order the queue
+    // expects: the fixed 16-byte header - a solo DATA packet, sequence
+    // 1, message 1 - followed by the payload. The payload is big enough
+    // that the +1000 lie of the second case pushes the reported size
+    // past the provided 16 + 1500 bytes of capacity.
+    const size_t       payload_len = 600;
+    std::vector<char>  datagram(srt::CPacket::HDR_SIZE + payload_len);
+    uint32_t*          hdr = (uint32_t*)datagram.data();
+    hdr[0]                = htonl(1);                                        // SEQNO: data, sequence 1
+    hdr[1]                = htonl((uint32_t)srt::PacketBoundaryBits(srt::PB_SOLO) | 1u); // MSGNO: solo, message 1
+    hdr[2]                = htonl(0);                                        // TIMESTAMP
+    hdr[3]                = htonl(2);                                        // destination socket id
+    for (size_t i = 0; i < payload_len; ++i)
+        datagram[srt::CPacket::HDR_SIZE + i] = (char)(i & 0xff);
+
+    // The honest deliver: the reported size is the size of the datagram,
+    // and the datagram is taken in whole.
+    {
+        srt::SRTTransportQueue queue(&NullSend, NULL);
+        ASSERT_EQ(queue.push(datagram.data(), datagram.size(), (const struct sockaddr*)&src_addr, sizeof src_addr),
+                  0);
+
+        const srt::CChannelVirtual channel(
+            queue.getConfig(), srt::sockaddr_any((const struct sockaddr*)&label_addr, sizeof label_addr), false);
+
+        srt::CPacket packet;
+        packet.allocate(1500);
+        srt::sockaddr_any from(AF_INET);
+
+        EXPECT_EQ(channel.recvfrom(from, packet), srt::RST_OK);
+        EXPECT_EQ(packet.getLength(), payload_len);
+        // The datagram was really scattered into the provided buffers
+        // (a data packet's payload stays in the network byte order).
+        EXPECT_EQ(memcmp(packet.getData(), datagram.data() + srt::CPacket::HDR_SIZE, payload_len), 0);
+    }
+
+    // deliver reports 1000 more than it wrote - past the provided
+    // buffers. Like MSG_TRUNC on a UDP socket, the datagram must be
+    // dropped: RST_AGAIN with the packet length reset, never a length
+    // planted beyond the payload buffer.
+    {
+        srt::SRTTransportQueue queue(&NullSend, NULL);
+        ASSERT_EQ(queue.push(datagram.data(), datagram.size(), (const struct sockaddr*)&src_addr, sizeof src_addr),
+                  0);
+
+        SRT_VirtualTransportConfig cfg = queue.getConfig();
+        cfg.deliver = &DeliverLyingLarge; // the config's opaq stays the queue
+
+        const srt::CChannelVirtual channel(
+            cfg, srt::sockaddr_any((const struct sockaddr*)&label_addr, sizeof label_addr), false);
+
+        srt::CPacket packet;
+        packet.allocate(1500);
+        srt::sockaddr_any from(AF_INET);
+
+        EXPECT_EQ(channel.recvfrom(from, packet), srt::RST_AGAIN);
+        EXPECT_EQ(packet.getLength(), (size_t)-1) << "a size past the provided buffers was planted as the length";
+    }
+
+    // deliver reports a negative size other than -1: it must not wrap
+    // around into a huge unsigned value, but drop the datagram the same
+    // way.
+    {
+        srt::SRTTransportQueue queue(&NullSend, NULL);
+        ASSERT_EQ(queue.push(datagram.data(), datagram.size(), (const struct sockaddr*)&src_addr, sizeof src_addr),
+                  0);
+
+        SRT_VirtualTransportConfig cfg = queue.getConfig();
+        cfg.deliver = &DeliverLyingNegative;
+
+        const srt::CChannelVirtual channel(
+            cfg, srt::sockaddr_any((const struct sockaddr*)&label_addr, sizeof label_addr), false);
+
+        srt::CPacket packet;
+        packet.allocate(1500);
+        srt::sockaddr_any from(AF_INET);
+
+        EXPECT_EQ(channel.recvfrom(from, packet), srt::RST_AGAIN);
+        EXPECT_EQ(packet.getLength(), (size_t)-1) << "a negative report wrapped into a bogus length";
+    }
 }

@@ -1356,11 +1356,22 @@ EReadStatus CChannelVirtual::recvfrom(sockaddr_any& w_addr, CPacket& w_packet) c
 
     // From here on, mirror the recvmsg() path of CChannelUDP::recvfrom.
 
-    // Sanity check for a case when it didn't fill in even the header
-    if (size_t(recv_size) < CPacket::HDR_SIZE)
+    // Sanity check: the owner callback must report the datagram as
+    // fitting into the buffers provided to it. On a UDP socket the
+    // kernel enforces this for free - recvmsg() never writes past the
+    // iovecs and reports MSG_TRUNC for a datagram too big, which is
+    // treated as a drop - but the owner callback is arbitrary code, so
+    // the bound must be enforced here. The comparison stays signed,
+    // before any unsigned conversion, so that a negative report other
+    // than -1 (handled above) cannot wrap around into a huge size_t.
+    if (recv_size < (int)CPacket::HDR_SIZE
+        || recv_size > (int)(vec[CPacket::PV_HEADER].len + vec[CPacket::PV_DATA].len))
     {
         HLOGC(krlog.Debug,
-              log << CONID() << "POSSIBLE ATTACK: received too short packet with " << recv_size << " bytes");
+              log << CONID() << "the deliver callback reported " << recv_size
+                  << " bytes, outside the provided buffer capacity of "
+                  << (vec[CPacket::PV_HEADER].len + vec[CPacket::PV_DATA].len)
+                  << " bytes - discarding the datagram");
         w_packet.setLength(-1);
         return RST_AGAIN;
     }
