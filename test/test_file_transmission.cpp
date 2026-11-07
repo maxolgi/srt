@@ -39,6 +39,13 @@ TEST(FileTransmission, Upload)
 {
     srt::TestInit srtinit;
 
+    // Test processes launched in parallel by ctest share the working
+    // directory, so every file-using test must use its own file names -
+    // a concurrent test truncating a shared "file.source" mid-send breaks
+    // both tests.
+    const std::string source_file = "file.upload.source";
+    const std::string target_file = "file.upload.target";
+
     // Generate the source file
     // We need a file that will contain more data
     // than can be contained in one sender buffer.
@@ -89,7 +96,7 @@ TEST(FileTransmission, Upload)
 
     {
         std::cout << "WILL CREATE source file with size=" << filesize << " (= 7 * " << optval << "[sndbuf])\n";
-        std::ofstream outfile("file.source", std::ios::out | std::ios::binary);
+        std::ofstream outfile(source_file, std::ios::out | std::ios::binary);
         ASSERT_EQ(!!outfile, true) << srt_getlasterror_str();
 
         std::random_device rd;
@@ -139,7 +146,7 @@ TEST(FileTransmission, Upload)
                 return;
             }
 
-            std::ofstream copyfile("file.target", std::ios::out | std::ios::trunc | std::ios::binary);
+            std::ofstream copyfile(target_file, std::ios::out | std::ios::trunc | std::ios::binary);
             std::vector<char> buf(1456);
 
             std::cout << "[A] Connected, reading data...\n";
@@ -198,7 +205,7 @@ TEST(FileTransmission, Upload)
 
         std::cout << "Connection initialized" << std::endl;
 
-        std::ifstream ifile("file.source", std::ios::in | std::ios::binary);
+        std::ifstream ifile(source_file, std::ios::in | std::ios::binary);
         std::vector<char> buf(1456);
 
         std::cout << "Reading file and sending...\n";
@@ -252,7 +259,7 @@ TEST(FileTransmission, Upload)
     std::cout << "Sockets closed, joining receiver thread\n";
     client.join();
 
-    std::ifstream tarfile("file.target", std::ios::in | std::ios::binary);
+    std::ifstream tarfile(target_file, std::ios::in | std::ios::binary);
     EXPECT_EQ(!!tarfile, true);
 
     tarfile.seekg(0, std::ios::end);
@@ -265,9 +272,9 @@ TEST(FileTransmission, Upload)
     // Theoretically it should work if you just rewind to 0, but
     // on Windows this somehow doesn't work. 
     tarfile.close();
-    tarfile.open("file.target", std::ios::in | std::ios::binary);
+    tarfile.open(target_file, std::ios::in | std::ios::binary);
 
-    std::ifstream ifile("file.source", std::ios::in | std::ios::binary);
+    std::ifstream ifile(source_file, std::ios::in | std::ios::binary);
 
     // Compare in blocks. The byte-by-byte variant ran one EXPECT_EQ per byte, which for
     // a file this size cost seconds; on mismatch we still report the exact offset.
@@ -300,14 +307,21 @@ TEST(FileTransmission, Upload)
     if (srt::TestEnv::me->OptionPresent("dont-remove"))
         return;
 
-    remove("file.source");
-    remove("file.target");
+    remove(source_file.c_str());
+    remove(target_file.c_str());
 }
 
 
 TEST(Transmission, FileUploadInterrupted)
 {
     srt::TestInit srtinit;
+
+    // Test processes launched in parallel by ctest share the working
+    // directory, so every file-using test must use its own file names -
+    // a concurrent test truncating a shared "file.source" mid-send breaks
+    // both tests.
+    const std::string source_file = "file.interrupt.source";
+    const std::string target_file = "file.interrupt.target";
     srtinit.HandlePerTestOptions();
 
     // Generate the source file
@@ -349,7 +363,7 @@ TEST(Transmission, FileUploadInterrupted)
 
     {
         std::cout << "WILL CREATE source file with size=" << filesize << " (= 7 * " << optval << "[sndbuf])\n";
-        std::ofstream outfile("file.source", std::ios::out | std::ios::binary);
+        std::ofstream outfile(source_file, std::ios::out | std::ios::binary);
         ASSERT_EQ(!!outfile, true) << srt_getlasterror_str();
 
         std::random_device rd;
@@ -386,7 +400,7 @@ TEST(Transmission, FileUploadInterrupted)
             return;
         }
 
-        std::ofstream copyfile("file.target", std::ios::out | std::ios::trunc | std::ios::binary);
+        std::ofstream copyfile(target_file, std::ios::out | std::ios::trunc | std::ios::binary);
 
         std::vector<char> buf(1456);
 
@@ -413,7 +427,7 @@ TEST(Transmission, FileUploadInterrupted)
 
     std::cout << "Connection initialized" << std::endl;
 
-    std::ifstream ifile("file.source", std::ios::in | std::ios::binary);
+    std::ifstream ifile(source_file, std::ios::in | std::ios::binary);
     std::vector<char> buf(1456);
 
     std::cout << "Reading file and sending...\n";
@@ -452,8 +466,8 @@ TEST(Transmission, FileUploadInterrupted)
     std::cout << "Sockets closed, joining receiver thread\n";
     client.join();
 
-    remove("file.source");
-    remove("file.target");
+    remove(source_file.c_str());
+    remove(target_file.c_str());
 
 }
 
