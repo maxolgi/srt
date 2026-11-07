@@ -1048,6 +1048,64 @@ TEST_F(TestVirtualTransport, RendezvousWithVirtualRejected)
     m_caller_sock = SRT_INVALID_SOCK;
 }
 
+// The bind-time check of srt_bind_virtual covers rendezvous set BEFORE
+// the bind (pinned by BindVirtualDoubleBindRejected with
+// SRT_ERDVNOSERV). This test pins the reverse order on the PUBLIC
+// binding - the stock handshake form srt_bind_virtual configures, as
+// opposed to the conclusion-first internal form of the test above:
+// rendezvous set AFTER a successful public bind is accepted at set time
+// (the option only demands that the socket not be connecting yet), then
+// refused at connect time by the virtual-channel guard in startConnect,
+// with the same MJ_NOTSUP/MN_INVAL error. The refusal must be
+// synchronous - not a waveahand-retransmit loop ended by a timeout -
+// and must leave the socket closable without a hang.
+TEST_F(TestVirtualTransport, RendezvousAfterPublicVirtualBindRejected)
+{
+    const sockaddr_in self_addr = FillV4("10.226.0.1", 5555);
+    const sockaddr_in peer_addr = FillV4("10.226.0.2", 5555);
+
+    // A stock multiplexer through the PUBLIC bind - the form the
+    // refusal is guarding.
+    m_caller_sock = srt_create_socket();
+    ASSERT_NE(m_caller_sock, SRT_INVALID_SOCK);
+    m_caller_wire.sock = m_caller_sock;
+    {
+        const SRT_VirtualTransportConfig cfg = m_caller_queue.getConfig();
+        ASSERT_EQ(srt_bind_virtual(m_caller_sock, (const sockaddr*)&self_addr, (int)sizeof self_addr, &cfg),
+                  SRT_STATUS_OK)
+            << srt_getlasterror_str();
+    }
+
+    // Rendezvous set AFTER the virtual bind: accepted at set time (the
+    // option only demands that the socket not be connecting yet)...
+    const int yes = 1;
+    ASSERT_NE(srt_setsockopt(m_caller_sock, 0, SRTO_RENDEZVOUS, &yes, sizeof yes), SRT_ERROR)
+        << srt_getlasterror_str();
+
+    // ...but refused at connect time, synchronously - the refusal must
+    // not decay into a waveahand-retransmit loop ended by a timeout. The
+    // measured duration doubles as the guard against that regression.
+    const std::chrono::steady_clock::time_point connect_start = std::chrono::steady_clock::now();
+    EXPECT_EQ(srt_connect(m_caller_sock, (const sockaddr*)&peer_addr, (int)sizeof peer_addr), SRT_ERROR);
+    // MJ_NOTSUP/MN_INVAL, the synchronous refusal of startConnect.
+    ExpectLastErrno(SRT_EINVPARAM);
+    const long long connect_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                     std::chrono::steady_clock::now() - connect_start)
+                                     .count();
+    EXPECT_LT(connect_ms, 1500) << "the refusal took the retransmit-until-timeout path";
+
+    // The CRITICAL pin: closing the refused socket must not hang. The
+    // connector must have been unregistered at throw time; a leaked entry
+    // would stall the close until the rendezvous-queue TTL expires (tens
+    // of seconds with the default connect timeout), far past this bound.
+    const std::chrono::steady_clock::time_point close_start = std::chrono::steady_clock::now();
+    EXPECT_EQ(srt_close(m_caller_sock), SRT_STATUS_OK) << srt_getlasterror_str();
+    const long long close_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - close_start).count();
+    EXPECT_LT(close_ms, 10000) << "closing the refused rendezvous socket stalled - a connector leaked into the queue";
+    m_caller_sock = SRT_INVALID_SOCK;
+}
+
 // The peer-label uniqueness rule of a virtual multiplexer: the source
 // label is an owner-assigned identity, so a second caller reusing the
 // label of a connection the listener already serves must be rejected -

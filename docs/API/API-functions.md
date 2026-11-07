@@ -619,6 +619,12 @@ always runs the stock handshake. (The conclusion-first form - the caller
 opening with the CONCLUSION handshake and no cookie exchange - exists as an
 internal srtcore integration setting, not reachable by any API call.)
 
+Rendezvous is not supported over a virtual transport. Setting
+[`SRTO_RENDEZVOUS`](API-socket-options.md#SRTO_RENDEZVOUS) before the bind
+fails the bind with [`SRT_ERDVNOSERV`](#srt_erdvnoserv) (see the errors
+table below); setting it after the bind makes the subsequent
+[`srt_connect`](#srt_connect) fail with [`SRT_EINVPARAM`](#srt_einvparam).
+
 The multiplexer of a virtual binding is dedicated to the one socket that made
 the bind call - unlike with [`srt_bind`](#srt_bind), it is never shared with
 another binding. Sockets accepted from a virtually bound listener join the
