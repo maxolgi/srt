@@ -126,7 +126,7 @@ struct SendCapture
         return datagrams.size();
     }
 
-    bool waitFor(size_t n, chrono::milliseconds timeout)
+    bool waitUntilCount(size_t n, chrono::milliseconds timeout)
     {
         unique_lock<mutex> lk(mx);
         return cv.wait_for(lk, timeout, [&] { return datagrams.size() >= n; });
