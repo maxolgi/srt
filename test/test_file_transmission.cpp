@@ -64,30 +64,21 @@ TEST(FileTransmission, Upload)
     sockaddr_in sa_lsn = sockaddr_in();
     sa_lsn.sin_family = AF_INET;
     sa_lsn.sin_addr.s_addr = INADDR_ANY;
-    sa_lsn.sin_port = htons(5555);
+    sa_lsn.sin_port = 0; // the kernel picks a free port, read back after bind
 
     MAKE_UNIQUE_SOCK(sock_lsn_u, "listener", sock_lsn);
     MAKE_UNIQUE_SOCK(sock_clr_u, "listener", sock_clr);
 
     // Find unused a port not used by any other service.    
     // Otherwise srt_connect may actually connect.
-    SRTSTATUS bind_res = SRT_ERROR;
-    std::cout << "Looking for a free port... " << std::flush;
-    for (int port = 5000; port <= 5555; ++port)
+    // Bind to a kernel-picked port so that parallel test processes never collide.
+    SRTSTATUS bind_res = srt_bind(sock_lsn, (sockaddr*)&sa_lsn, sizeof sa_lsn);
+    ASSERT_EQ(bind_res, SRT_STATUS_OK);
     {
-        sa_lsn.sin_port = htons(port);
-        bind_res = srt_bind(sock_lsn, (sockaddr*)&sa_lsn, sizeof sa_lsn);
-        int bind_err = srt_getlasterror(NULL);
-        if (bind_res == SRT_STATUS_OK)
-        {
-            std::cout << "Running test on port " << port << "\n";
-            break;
-        }
-
-        ASSERT_TRUE(bind_err == SRT_EINVOP) << "Bind failed not due to an occupied port. Result " << bind_err;
+        int sa_len = sizeof sa_lsn;
+        ASSERT_EQ(srt_getsockname(sock_lsn, (sockaddr*)&sa_lsn, &sa_len), 0);
+        std::cout << "Running test on port " << ntohs(sa_lsn.sin_port) << "\n";
     }
-
-    ASSERT_GE((int)bind_res, 0);
 
     srt_bind(sock_lsn, (sockaddr*)&sa_lsn, sizeof sa_lsn);
 
@@ -333,29 +324,21 @@ TEST(Transmission, FileUploadInterrupted)
     sockaddr_in sa_lsn = sockaddr_in();
     sa_lsn.sin_family = AF_INET;
     sa_lsn.sin_addr.s_addr = INADDR_ANY;
-    sa_lsn.sin_port = htons(5555);
+    sa_lsn.sin_port = 0; // the kernel picks a free port, read back after bind
 
     MAKE_UNIQUE_SOCK(sock_lsn_u, "listener", sock_lsn);
     MAKE_UNIQUE_SOCK(sock_clr_u, "listener", sock_clr);
 
     // Find unused a port not used by any other service.    
     // Otherwise srt_connect may actually connect.
-    int bind_res = -1;
-    std::cout << "Looking for a free port... " << std::flush;
-    for (int port = 5000; port <= 5555; ++port)
+    // Bind to a kernel-picked port so that parallel test processes never collide.
+    int bind_res = srt_bind(sock_lsn, (sockaddr*)&sa_lsn, sizeof sa_lsn);
+    ASSERT_EQ(bind_res, 0);
     {
-        sa_lsn.sin_port = htons(port);
-        bind_res = srt_bind(sock_lsn, (sockaddr*)&sa_lsn, sizeof sa_lsn);
-        if (bind_res == 0)
-        {
-            std::cout << "Running test on port " << port << "\n";
-            break;
-        }
-
-        ASSERT_TRUE(bind_res == SRT_EINVOP) << "Bind failed not due to an occupied port. Result " << bind_res;
+        int sa_len = sizeof sa_lsn;
+        ASSERT_EQ(srt_getsockname(sock_lsn, (sockaddr*)&sa_lsn, &sa_len), 0);
+        std::cout << "Running test on port " << ntohs(sa_lsn.sin_port) << "\n";
     }
-
-    ASSERT_GE(bind_res, 0);
 
     srt_bind(sock_lsn, (sockaddr*)&sa_lsn, sizeof sa_lsn);
 
@@ -504,31 +487,23 @@ TEST(FileTransmission, Setup46)
 
     ASSERT_NE(srt_bind(sock_clr, sa.get(), sa.size()), -1);
 
-    int connect_port = 5555;
+    int connect_port = 0; // the kernel picks a free port, read back after bind
 
     // Configure listener 
     sockaddr_in sa_lsn = sockaddr_in();
     sa_lsn.sin_family = AF_INET;
     sa_lsn.sin_addr.s_addr = INADDR_ANY;
-    sa_lsn.sin_port = htons(connect_port);
+    sa_lsn.sin_port = 0;
 
-    // Find unused a port not used by any other service.    
-    // Otherwise srt_connect may actually connect.
-    int bind_res = -1;
-    for (connect_port = 5000; connect_port <= 5555; ++connect_port)
+    // Bind to a kernel-picked port so that parallel test processes never collide.
+    int bind_res = srt_bind(sock_lsn, (sockaddr*)&sa_lsn, sizeof sa_lsn);
+    ASSERT_EQ(bind_res, 0);
     {
-        sa_lsn.sin_port = htons(connect_port);
-        bind_res = srt_bind(sock_lsn, (sockaddr*)&sa_lsn, sizeof sa_lsn);
-        if (bind_res == 0)
-        {
-            std::cout << "Running test on port " << connect_port << "\n";
-            break;
-        }
-
-        ASSERT_TRUE(bind_res == SRT_EINVOP) << "Bind failed not due to an occupied port. Result " << bind_res;
+        int sa_len = sizeof sa_lsn;
+        ASSERT_EQ(srt_getsockname(sock_lsn, (sockaddr*)&sa_lsn, &sa_len), 0);
+        connect_port = ntohs(sa_lsn.sin_port);
+        std::cout << "Running test on port " << connect_port << "\n";
     }
-
-    ASSERT_GE(bind_res, 0);
 
     srt_listen(sock_lsn, 1);
 
@@ -606,28 +581,19 @@ TEST(FileTransmission, Setup66)
 
     ASSERT_NE(srt_bind(sock_clr, sa.get(), sa.size()), -1);
 
-    int connect_port = 5555;
+    int connect_port = 0; // the kernel picks a free port, read back after bind
 
-    // Configure listener 
+    // Configure listener
     sockaddr_any sa_lsn(AF_INET6);
 
-    // Find unused a port not used by any other service.    
-    // Otherwise srt_connect may actually connect.
-    int bind_res = -1;
-    for (connect_port = 5000; connect_port <= 5555; ++connect_port)
+    // Bind to a kernel-picked port so that parallel test processes never collide.
+    int bind_res = srt_bind(sock_lsn, sa_lsn.get(), sa_lsn.size());
+    ASSERT_EQ(bind_res, 0);
     {
-        sa_lsn.hport(connect_port);
-        bind_res = srt_bind(sock_lsn, sa_lsn.get(), sa_lsn.size());
-        if (bind_res == 0)
-        {
-            std::cout << "Running test on port " << connect_port << "\n";
-            break;
-        }
-
-        ASSERT_TRUE(bind_res == SRT_EINVOP) << "Bind failed not due to an occupied port. Result " << bind_res;
+        ASSERT_EQ(srt_getsockname(sock_lsn, sa_lsn.get(), &sa_lsn.len), 0);
+        connect_port = sa_lsn.hport();
+        std::cout << "Running test on port " << connect_port << "\n";
     }
-
-    ASSERT_GE(bind_res, 0);
 
     srt_listen(sock_lsn, 1);
 
@@ -706,15 +672,13 @@ TEST(Transmission, MessageTTLDropDoesNotStallSender)
     sockaddr_in sa = sockaddr_in();
     sa.sin_family = AF_INET;
     sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    int bind_res = -1;
-    for (int port = 5000; port <= 5555; ++port)
-    {
-        sa.sin_port = htons(port);
-        bind_res = srt_bind(sock_lsn, (sockaddr*)&sa, sizeof sa);
-        if (bind_res == 0)
-            break;
-    }
+    sa.sin_port = 0; // the kernel picks a free port, read back after bind
+    int bind_res = srt_bind(sock_lsn, (sockaddr*)&sa, sizeof sa);
     ASSERT_EQ(bind_res, 0);
+    {
+        int sa_len = sizeof sa;
+        ASSERT_EQ(srt_getsockname(sock_lsn, (sockaddr*)&sa, &sa_len), 0);
+    }
     ASSERT_NE(srt_listen(sock_lsn, 1), SRT_ERROR);
     ASSERT_NE(srt_connect(sock_clr, (sockaddr*)&sa, sizeof sa), SRT_ERROR);
     sockaddr_in remote;

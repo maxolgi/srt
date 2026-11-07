@@ -394,10 +394,16 @@ public:
         sockaddr_in sa;
         memset(&sa, 0, sizeof sa);
         sa.sin_family = AF_INET;
-        sa.sin_port = htons(5200);
+        // Port 0: the kernel picks a free port so parallel test processes
+        // never collide on the listener; it is read back after the bind.
+        sa.sin_port = 0;
         ASSERT_EQ(inet_pton(AF_INET, "127.0.0.1", &sa.sin_addr), 1);
         sockaddr* psa = (sockaddr*)&sa;
         ASSERT_NE(srt_bind(m_listener_socket, psa, sizeof sa), SRT_ERROR);
+        {
+            int sa_len = sizeof sa;
+            ASSERT_EQ(srt_getsockname(m_listener_socket, psa, &sa_len), 0);
+        }
         ASSERT_NE(srt_listen(m_listener_socket, 4), SRT_ERROR);
 
         SRTSOCKET accepted_socket = SRT_INVALID_SOCK;
@@ -527,7 +533,7 @@ public:
             ofcoutl("[T] EXIT");
         });
 
-        ofcoutl("CONNECTING to localhost:5200 - expected result: ", expect.connect_ret);
+        ofcoutl("CONNECTING to localhost:", ntohs(sa.sin_port), " - expected result: ", expect.connect_ret);
 
         const SRTSOCKET connect_ret = srt_connect(m_caller_socket, psa, sizeof sa);
         EXPECT_EQ(connect_ret, expect.connect_ret);
@@ -668,7 +674,7 @@ public:
 
         // NOTE: no need to wait for a GC cycle here. All sockets used by this
         // test are explicitly closed above and the listener's multiplexer is
-        // refcounted, so the next test rebinding 127.0.0.1:5200 simply reuses
+        // refcounted, so the next test rebinding on loopback simply reuses
         // or recreates it. A blind 1s sleep here used to dominate the runtime
         // of the whole suite (40 cases x 1s).
     }

@@ -132,16 +132,23 @@ TEST(Bonding, SRTConnectGroup)
 
 static std::mutex g_listening_stopped;
 
-void listening_thread(bool should_read)
+void listening_thread(std::promise<int>& listen_port, bool should_read)
 {
     const SRTSOCKET server_sock = srt_create_socket();
     sockaddr_in bind_sa;
     memset(&bind_sa, 0, sizeof bind_sa);
     bind_sa.sin_family = AF_INET;
     EXPECT_EQ(inet_pton(AF_INET, "127.0.0.1", &bind_sa.sin_addr), 1);
-    bind_sa.sin_port = htons(4200);
+    // Port 0: the kernel picks a free one; it is published through the
+    // promise so that parallel test processes never collide on a fixed port.
+    bind_sa.sin_port = 0;
 
     EXPECT_SRT_SUCCESS(srt_bind(server_sock, (sockaddr*)&bind_sa, sizeof bind_sa));
+    {
+        int bind_sa_len = sizeof bind_sa;
+        EXPECT_EQ(srt_getsockname(server_sock, (sockaddr*)&bind_sa, &bind_sa_len), 0);
+        listen_port.set_value(ntohs(bind_sa.sin_port));
+    }
     const int yes = 1;
     EXPECT_SRT_SUCCESS(srt_setsockflag(server_sock, SRTO_GROUPCONNECT, &yes, sizeof yes));
 
@@ -266,7 +273,7 @@ TEST(Bonding, NonBlockingGroupConnect)
 
     sockaddr_in sa;
     sa.sin_family = AF_INET;
-    sa.sin_port = htons(4200);
+    sa.sin_port = 0; // filled from the port the listener thread publishes
     EXPECT_EQ(inet_pton(AF_INET, "127.0.0.1", &sa.sin_addr), 1);
 
     sockaddr_in safail = sa;
@@ -276,7 +283,11 @@ TEST(Bonding, NonBlockingGroupConnect)
     // until we are done.
     std::unique_lock<std::mutex> listen_lock (g_listening_stopped);
 
-    std::future<void> listen_promise = std::async(std::launch::async, std::bind(&listening_thread, false));
+    std::promise<int> listen_port;
+    std::future<int> listen_port_future = listen_port.get_future();
+    std::future<void> listen_promise = std::async(std::launch::async,
+        [&listen_port]() { listening_thread(listen_port, false); });
+    sa.sin_port = htons(listen_port_future.get());
     
     std::cout << "Connecting two sockets " << std::endl;
     {
@@ -365,10 +376,14 @@ TEST(Bonding, CloseGroupAndSocket)
 
     sockaddr_in sa;
     sa.sin_family = AF_INET;
-    sa.sin_port = htons(4200);
+    sa.sin_port = 0; // filled from the port the listener thread publishes
     ASSERT_EQ(inet_pton(AF_INET, "127.0.0.1", &sa.sin_addr), 1);
 
-    std::future<void> listen_promise = std::async(std::launch::async, std::bind(listening_thread, true));
+    std::promise<int> listen_port;
+    std::future<int> listen_port_future = listen_port.get_future();
+    std::future<void> listen_promise = std::async(std::launch::async,
+        [&listen_port]() { listening_thread(listen_port, true); });
+    sa.sin_port = htons(listen_port_future.get());
 
     std::cout << "Connecting two sockets " << std::endl;
     for (int i = 0; i < 2; ++i)
@@ -536,6 +551,7 @@ TEST(Bonding, Options)
     mutex mx;
     condition_variable latch;
     atomic<bool> started {false};
+    int listen_port = 0; // the port the listener thread picks, valid once 'started'
 
     thread accept_and_close { [&]() {
 
@@ -551,8 +567,12 @@ TEST(Bonding, Options)
 #endif
         int allow = 1;
         EXPECT_NE(srt_setsockflag(lsn, SRTO_GROUPCONNECT, &allow, sizeof allow), SRT_ERROR);
-        sockaddr_any sa = srt::CreateAddr("127.0.0.1", 5555, AF_INET);
+        // Port 0: the kernel picks a free one, read back and published
+        // through listen_port before the started flag goes up.
+        sockaddr_any sa = srt::CreateAddr("127.0.0.1", 0, AF_INET);
         EXPECT_NE(srt_bind(lsn, sa.get(), sa.size()), SRT_ERROR);
+        EXPECT_NE(srt_getsockname(lsn, sa.get(), &sa.len), SRT_ERROR);
+        listen_port = sa.hport();
         EXPECT_NE(srt_listen(lsn, 1), SRT_ERROR);
         started = true;
 
@@ -596,7 +616,7 @@ TEST(Bonding, Options)
     }
 
     // Now the thread is accepting, so we call the connect.
-    sockaddr_any sa = srt::CreateAddr("127.0.0.1", 5555, AF_INET);
+    sockaddr_any sa = srt::CreateAddr("127.0.0.1", listen_port, AF_INET);
     SRTSOCKET member = srt_connect(grp, sa.get(), sa.size());
 
     // We've released the mutex and signaled the CV, so accept should proceed now.
@@ -688,23 +708,26 @@ TEST(Bonding, InitialFailure)
     MAKE_UNIQUE_SOCK(lsn, "Listener", srt_create_socket());
     MAKE_UNIQUE_SOCK(grp, "GrpCaller", srt_create_group(SRT_GTYPE_BROADCAST));
 
-    // Create the listener on port 5555.
+    // Create the listener on a kernel-picked port.
     int allow = 1;
     ASSERT_NE(srt_setsockflag(lsn, SRTO_GROUPCONNECT, &allow, sizeof allow), SRT_ERROR);
 
     ofcoutl("Binding listener @", lsn);
-    sockaddr_any sa = srt::CreateAddr("127.0.0.1", 5555, AF_INET);
+    // Port 0: the kernel picks a free one, read back after the bind.
+    sockaddr_any sa = srt::CreateAddr("127.0.0.1", 0, AF_INET);
     ASSERT_NE(srt_bind(lsn, sa.get(), sa.size()), SRT_ERROR);
+    ASSERT_NE(srt_getsockname(lsn, sa.get(), &sa.len), SRT_ERROR);
+    const int listen_port = sa.hport();
     ASSERT_NE(srt_listen(lsn, 5), SRT_ERROR);
 
     // Create a group
     // Connect 3 members in the group.
     std::vector<SRT_SOCKGROUPCONFIG> targets;
     targets.push_back(PrepareEndpoint("127.0.0.1", 5556)); // NOTE: NONEXISTENT LISTENER
-    targets.push_back(PrepareEndpoint("127.0.0.1", 5555));
-    targets.push_back(PrepareEndpoint("127.0.0.1", 5555));
+    targets.push_back(PrepareEndpoint("127.0.0.1", listen_port));
+    targets.push_back(PrepareEndpoint("127.0.0.1", listen_port));
 
-    ofcoutl("Connecting to 0: 5556[N/E], 5555, 5555");
+    ofcoutl("Connecting to 0: 5556[N/E], ", listen_port, ", ", listen_port);
     // This should block until the connection is established, but
     // accepted socket should be spawned and just wait for extraction.
     const SRTSOCKET conn = srt_connect_group(grp, targets.data(), (int)targets.size());
@@ -776,9 +799,10 @@ TEST(Bonding, DeadLinkUpdate)
 
     inet_pton(AF_INET, "127.0.0.1", sa.get_addr());
 
-    sa.hport(5555);
+    sa.hport(0); // the kernel picks a free port, read back after the bind
 
     srt_bind(listener, sa.get(), sa.size());
+    srt_getsockname(listener, sa.get(), &sa.len);
     srt::setopt(listener)[SRTO_GROUPCONNECT] = 1;
     srt_listen(listener, 1);
     char srcbuf [] = "1234ABCD";
@@ -1045,7 +1069,6 @@ TEST(Bonding, ConnectNonBlocking)
     TestInit srtinit;
 
     const string ADDR = "127.0.0.1";
-    const int PORT = 4209;
 
     // NOTE: Add more group types, if implemented!
     vector<SRT_GROUP_TYPE> types { SRT_GTYPE_BROADCAST, SRT_GTYPE_BACKUP };
@@ -1058,9 +1081,12 @@ TEST(Bonding, ConnectNonBlocking)
     {
         g_listen_socket = srt_create_socket();
 
-        sockaddr_any sa = srt::CreateAddr(ADDR, PORT, AF_INET);
+        sockaddr_any sa = srt::CreateAddr(ADDR, 0, AF_INET);
 
         EXPECT_NE(srt_bind(g_listen_socket, sa.get(), sa.size()), -1);
+        // Read back the port the kernel picked so the group endpoints below
+        // target it, and parallel test processes never collide.
+        EXPECT_NE(srt_getsockname(g_listen_socket, sa.get(), &sa.len), -1);
         const int yes = 1;
         srt_setsockflag(g_listen_socket, SRTO_GROUPCONNECT, &yes, sizeof yes);
 
@@ -1279,9 +1305,12 @@ TEST(Bonding, BackupPriorityBegin)
     g_listen_socket = srt_create_socket();
     ASSERT_NE(g_listen_socket, SRT_INVALID_SOCK);
 
-    sockaddr_any bind_sa = srt::CreateAddr("127.0.0.1", 4200, AF_INET);
+    // Port 0: the kernel picks a free one, read back after the bind.
+    sockaddr_any bind_sa = srt::CreateAddr("127.0.0.1", 0, AF_INET);
 
     EXPECT_NE(srt_bind(g_listen_socket, bind_sa.get(), bind_sa.size()), -1);
+    EXPECT_NE(srt_getsockname(g_listen_socket, bind_sa.get(), &bind_sa.len), -1);
+    const int listen_port = bind_sa.hport();
     const int yes = 1;
     srt_setsockflag(g_listen_socket, SRTO_GROUPCONNECT, &yes, sizeof yes);
     EXPECT_NE(srt_listen(g_listen_socket, 5), -1);
@@ -1293,7 +1322,7 @@ TEST(Bonding, BackupPriorityBegin)
 
     srt_connect_callback(ss, &ConnectCallback, this);
 
-    sockaddr_any sa = srt::CreateAddr("127.0.0.1", 4200, AF_INET);
+    sockaddr_any sa = srt::CreateAddr("127.0.0.1", listen_port, AF_INET);
 
     auto acthr = std::thread([]() {
             sockaddr_any adr;
@@ -1420,9 +1449,12 @@ TEST(Bonding, BackupPriorityTakeover)
     g_listen_socket = srt_create_socket();
     ASSERT_NE(g_listen_socket, SRT_INVALID_SOCK);
 
-    sockaddr_any bind_sa = srt::CreateAddr("127.0.0.1", 4200, AF_INET);
+    // Port 0: the kernel picks a free one, read back after the bind.
+    sockaddr_any bind_sa = srt::CreateAddr("127.0.0.1", 0, AF_INET);
 
     EXPECT_NE(srt_bind(g_listen_socket, bind_sa.get(), bind_sa.size()), -1);
+    EXPECT_NE(srt_getsockname(g_listen_socket, bind_sa.get(), &bind_sa.len), -1);
+    const int listen_port = bind_sa.hport();
     const int yes = 1;
     srt_setsockflag(g_listen_socket, SRTO_GROUPCONNECT, &yes, sizeof yes);
     EXPECT_NE(srt_listen(g_listen_socket, 5), -1);
@@ -1465,7 +1497,7 @@ TEST(Bonding, BackupPriorityTakeover)
             cout << "[A] thread finished\n";
     });
 
-    sockaddr_any sa = srt::CreateAddr("127.0.0.1", 4200, AF_INET);
+    sockaddr_any sa = srt::CreateAddr("127.0.0.1", listen_port, AF_INET);
 
     cout << "Connecting first link weight=0:\n";
 
@@ -1622,11 +1654,14 @@ TEST(Bonding, BackupPrioritySelection)
     sync::atomic<bool> checks_done { false }; // main has finished inspecting the group state
 
     // 1.
-    sockaddr_any bind_sa = srt::CreateAddr("127.0.0.1", 4200, AF_INET);
+    // Port 0: the kernel picks a free one, read back after the bind.
+    sockaddr_any bind_sa = srt::CreateAddr("127.0.0.1", 0, AF_INET);
 
     g_listen_socket = srt_create_socket();
     ASSERT_NE(g_listen_socket, SRT_INVALID_SOCK);
     EXPECT_NE(srt_bind(g_listen_socket, bind_sa.get(), bind_sa.size()), -1);
+    EXPECT_NE(srt_getsockname(g_listen_socket, bind_sa.get(), &bind_sa.len), -1);
+    const int listen_port = bind_sa.hport();
     const int yes = 1;
     srt_setsockflag(g_listen_socket, SRTO_GROUPCONNECT, &yes, sizeof yes);
     EXPECT_NE(srt_listen(g_listen_socket, 5), -1);
@@ -1650,7 +1685,7 @@ TEST(Bonding, BackupPrioritySelection)
             cnlog.id()
             });
 
-    sockaddr_any sa = srt::CreateAddr("127.0.0.1", 4200, AF_INET);
+    sockaddr_any sa = srt::CreateAddr("127.0.0.1", listen_port, AF_INET);
 
     // 3.
     auto acthr = std::thread([&recvd, &checks_done]() {
