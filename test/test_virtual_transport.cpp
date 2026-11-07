@@ -1985,3 +1985,118 @@ TEST_F(TestVirtualTransport, ChannelBoundsDeliverReportByCapacity)
         EXPECT_EQ(packet.getLength(), (size_t)-1) << "a negative report wrapped into a bogus length";
     }
 }
+
+// The contract of SRT_VTWAIT_BROKEN: a waitread() that reports the medium
+// dead must break the connection (docs/API/API-functions.md: "the medium
+// is dead ... breaks the connection"), the same way a UDP connection
+// breaks when the peer goes silent - through the peer-idle timeout in
+// CUDT::checkExpTimer (EXP count over COMM_RESPONSE_MAX_EXP and no
+// response for iPeerIdleTimeout_ms). The trap this pins: CChannelVirtual
+// turns the broken report into a sticky RST_ERROR, and the receive worker
+// deliberately never exits on RST_ERROR (issue #3185) - if it merely logs
+// and continues, it skips the per-iteration update loop
+// (rollUpdateSockets -> checkTimers) while recvfrom returns instantly,
+// and the socket stays SRTS_CONNECTED forever with the worker spinning at
+// full CPU. The medium dies mid-connection through detach() on the
+// caller's queue (its waitread reports SRT_VTWAIT_BROKEN from then on,
+// its send fails - a WebTransport session closing under the socket), and
+// the caller must reach SRTS_BROKEN within a generous deadline. Only the
+// state transition is asserted: breaking within the deadline proves the
+// update loop ran, because a spinning worker starves it forever.
+TEST_F(TestVirtualTransport, MediumBrokenBreaksConnection)
+{
+    const sockaddr_in listener_addr = FillV4("10.225.0.2", 5555);
+    const sockaddr_in caller_addr   = FillV4("10.225.0.1", 5556);
+
+    PairWires(caller_addr, listener_addr);
+
+    // The peer-idle timeout the sockets will break by once the medium
+    // dies: SRTO_PEERIDLETIMEO, the option behind iPeerIdleTimeout_ms (an
+    // option of its own, not derived from SRTO_CONNTIMEO; the default is
+    // 5000 ms). One second is an honest idle tolerance for an in-memory
+    // wire and sits far under the break floor that anyway governs - the
+    // EXP machinery may only fire its 17th expiration (count over 16) at
+    // the 300 ms minimum EXP interval, about 5.1 s after the last
+    // response - so the honest break lands well inside the deadline.
+    const int peer_idle_timeout_ms = 1000;
+
+    // Listener side: conclusion-first both ways (the internal bind), as a
+    // WebTransport gateway would configure its sessions; the accepted
+    // socket inherits the listener's option.
+    m_listener_sock = srt_create_socket();
+    ASSERT_NE(m_listener_sock, SRT_INVALID_SOCK);
+    ASSERT_NE(srt_setsockopt(m_listener_sock, 0, SRTO_PEERIDLETIMEO, &peer_idle_timeout_ms, sizeof peer_idle_timeout_ms),
+              SRT_ERROR)
+        << srt_getlasterror_str();
+    m_listener_wire.sock = m_listener_sock;
+    BindVirtualConclusionFirst(m_listener_sock, listener_addr, m_listener_queue.getConfig());
+    ASSERT_NE(srt_listen(m_listener_sock, 4), SRT_ERROR) << srt_getlasterror_str();
+
+    m_caller_sock = srt_create_socket();
+    ASSERT_NE(m_caller_sock, SRT_INVALID_SOCK);
+    ASSERT_NE(srt_setsockopt(m_caller_sock, 0, SRTO_PEERIDLETIMEO, &peer_idle_timeout_ms, sizeof peer_idle_timeout_ms),
+              SRT_ERROR)
+        << srt_getlasterror_str();
+    m_caller_wire.sock = m_caller_sock;
+    BindVirtualConclusionFirst(m_caller_sock, caller_addr, m_caller_queue.getConfig());
+
+    ASSERT_NE(srt_connect(m_caller_sock, (const sockaddr*)&listener_addr, (int)sizeof listener_addr), SRT_ERROR)
+        << srt_getlasterror_str();
+
+    ASSERT_TRUE(WaitReadable(m_listener_sock, 15000)) << "no connection was ever queued on the listener";
+
+    sockaddr_in accept_addr;
+    int         accept_len = (int)sizeof accept_addr;
+    m_accepted_sock        = srt_accept(m_listener_sock, (sockaddr*)&accept_addr, &accept_len);
+    ASSERT_NE(m_accepted_sock, SRT_INVALID_SOCK) << srt_getlasterror_str();
+
+    ASSERT_TRUE(WaitState(m_caller_sock, SRTS_CONNECTED, 5000)) << "the caller never completed the connection";
+    EXPECT_EQ(srt_getsockstate(m_accepted_sock), SRTS_CONNECTED);
+
+    // One payload message across the seam, so the session provably flows
+    // before the medium dies (and the caller's last-response time is
+    // fresh at the detach). Fail fast should it not.
+    const int rcv_timeout_ms = 5000;
+    ASSERT_NE(srt_setsockopt(m_accepted_sock, 0, SRTO_RCVTIMEO, &rcv_timeout_ms, sizeof rcv_timeout_ms), SRT_ERROR)
+        << srt_getlasterror_str();
+    const char* payload     = "vt-medium session alive";
+    const int   payload_len = (int)strlen(payload);
+    char        buf[1456];
+    ASSERT_EQ(srt_sendmsg(m_caller_sock, payload, payload_len, SRT_MSGTTL_INF, false), payload_len)
+        << srt_getlasterror_str();
+    ASSERT_EQ(srt_recvmsg(m_accepted_sock, buf, (int)sizeof buf), payload_len) << srt_getlasterror_str();
+
+    // The medium dies mid-connection: from now on the caller's queue
+    // reports SRT_VTWAIT_BROKEN to waitread() and fails every send.
+    m_caller_queue.detach();
+
+    // Bounded poll for the break: far longer than the honest break time
+    // (~5 s), so only a starved update loop - the spinning receive worker
+    // of the bug - can run the deadline out while the socket still
+    // reports connected. SRTS_CLOSING/SRTS_CLOSED also pass, should a
+    // close race ahead of the observation.
+    const std::chrono::steady_clock::time_point deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    SRT_SOCKSTATUS final_state = srt_getsockstate(m_caller_sock);
+    while (final_state != SRTS_BROKEN && final_state != SRTS_CLOSING && final_state != SRTS_CLOSED
+           && std::chrono::steady_clock::now() < deadline)
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        final_state = srt_getsockstate(m_caller_sock);
+    }
+
+    EXPECT_TRUE(final_state == SRTS_BROKEN || final_state == SRTS_CLOSING || final_state == SRTS_CLOSED)
+        << "the medium broke mid-connection, but the caller never left state " << (int)final_state
+        << " (5 = SRTS_CONNECTED) before the 30 s deadline - the peer-idle break never fired";
+
+    // Clean close like the sibling tests - closing the already-broken
+    // caller is part of the coverage. The listener-side sockets were
+    // starved of the caller's packets since the detach (its sends all
+    // fail); closing them is enough.
+    EXPECT_EQ(srt_close(m_accepted_sock), SRT_STATUS_OK) << srt_getlasterror_str();
+    m_accepted_sock = SRT_INVALID_SOCK;
+    EXPECT_EQ(srt_close(m_caller_sock), SRT_STATUS_OK) << srt_getlasterror_str();
+    m_caller_sock = SRT_INVALID_SOCK;
+    EXPECT_EQ(srt_close(m_listener_sock), SRT_STATUS_OK) << srt_getlasterror_str();
+    m_listener_sock = SRT_INVALID_SOCK;
+}

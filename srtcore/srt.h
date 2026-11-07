@@ -841,8 +841,11 @@ typedef int SRT_VirtualTransportSendFunc(void* opaq, const struct sockaddr* dst,
 // Wait callback: replaces the select() call on a UDP socket. It must
 // return after at most timeout_ms milliseconds with the readiness state of
 // the medium. SRT_VTWAIT_BROKEN reports that the medium can no longer
-// carry datagrams; this terminates the receive worker and thereby breaks
-// the connection.
+// carry datagrams. After it is returned once, SRT invokes no callback of
+// this configuration again; the sockets using it break through the
+// peer-idle timeout (SRTO_PEERIDLETIMEO, default 5 s), the same way a UDP
+// connection breaks when the peer goes silent, and the receive worker
+// keeps servicing the multiplexer until every socket is closed.
 typedef SRT_VTWAIT SRT_VirtualTransportWaitReadFunc(void* opaq, int timeout_ms);
 
 // Deliver callback: invoked by SRT only after waitread returned

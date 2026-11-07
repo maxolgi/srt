@@ -391,9 +391,17 @@ private:
     sockaddr_any m_Label; // The local address reported by getSockAddr().
     bool m_bConclusionFirst; // The handshake form, from the internal bind path.
 
-    // Set by close()/stop() from a thread other than the receive worker,
-    // and when the medium reports itself broken; makes recvfrom() return
-    // RST_ERROR so that the receive worker exits.
+    // Set by stop()/close() from a thread other than the receive worker;
+    // makes recvfrom() return RST_ERROR immediately so that the receive
+    // worker exits promptly (the callers set the closing state first).
+    mutable sync::atomic<bool> m_bStopped;
+
+    // Set once the medium reports itself broken (waitread returned a value
+    // other than SRT_VTWAIT_READY and SRT_VTWAIT_TIMEOUT). From then on no
+    // callback of the configuration is invoked again; recvfrom() paces its
+    // RST_AGAIN returns so that the receive worker keeps servicing its
+    // update loop and the peer-idle timeout breaks the sockets, exactly
+    // like with a silent UDP peer.
     mutable sync::atomic<bool> m_bBroken;
 };
 

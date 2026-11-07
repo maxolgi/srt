@@ -1250,6 +1250,7 @@ CChannelVirtual::CChannelVirtual(const SRT_VirtualTransportConfig& cfg, const so
     : m_VTConfig(cfg)
     , m_Label(label)
     , m_bConclusionFirst(conclusion_first)
+    , m_bStopped(false)
     , m_bBroken(false)
 {
     LOGC(kmlog.Debug, log << "CHANNEL: VIRTUAL transport opened, local address: " << m_Label.str()
@@ -1260,7 +1261,7 @@ void CChannelVirtual::close()
 {
     // There is no OS entity to release and the callbacks are owned by the
     // transport owner; just make sure no callback is used anymore.
-    m_bBroken = true;
+    m_bStopped = true;
 }
 
 void CChannelVirtual::stop()
@@ -1268,7 +1269,7 @@ void CChannelVirtual::stop()
     // Like shutdown() on the OS socket in the UDP channel: makes the next
     // recvfrom() call return RST_ERROR so that the receive worker exits
     // promptly. The waiting granularity of recvfrom() bounds the delay.
-    m_bBroken = true;
+    m_bStopped = true;
 }
 
 sockaddr_any CChannelVirtual::getSockAddr() const
@@ -1279,6 +1280,13 @@ sockaddr_any CChannelVirtual::getSockAddr() const
 
 int CChannelVirtual::sendto(const sockaddr_any& addr, CPacket& packet, const CNetworkInterface& src_ni SRT_ATR_UNUSED) const
 {
+    // Once the medium is broken or the channel stopped, no callback of
+    // the configuration may run again; refusing the datagram here also
+    // spares the owner's dead medium the keepalive and timeout traffic
+    // that SRT would keep pushing into it.
+    if (m_bBroken || m_bStopped)
+        return -1;
+
     HLOGC(kslog.Debug,
           log << "CChannelVirtual::sendto: SENDING NOW DST=" << addr.str() << " target=@" << packet.id()
               << " size=" << packet.getLength() << " pkt.ts=" << packet.timestamp() << " " << packet.Info());
@@ -1307,14 +1315,30 @@ int CChannelVirtual::sendto(const sockaddr_any& addr, CPacket& packet, const CNe
 EReadStatus CChannelVirtual::recvfrom(sockaddr_any& w_addr, CPacket& w_packet) const
 {
     // The same waiting granularity as the select() call in
-    // CChannelUDP::recvfrom; it also bounds the time after which the
-    // receive worker notices that stop() was called.
+    // CChannelUDP::recvfrom; it bounds the time after which the receive
+    // worker notices that stop() was called, and paces the wait of the
+    // broken-medium state below.
     static const int WAIT_GRANULARITY_MS = 10;
 
-    if (m_bBroken)
+    if (m_bStopped)
     {
         w_packet.setLength(-1);
         return RST_ERROR;
+    }
+
+    if (m_bBroken)
+    {
+        // The medium is dead, so no callback of the configuration may be
+        // invoked again and waitread() is skipped. The receive worker
+        // never exits on a channel error (issue #3185), so a sticky
+        // RST_ERROR would make it spin and starve the update loop;
+        // pacing the wait and reporting RST_AGAIN, like an empty
+        // select() wait, keeps the loop serviced so that the peer-idle
+        // timeout in CUDT::checkTimers breaks the sockets, exactly like
+        // with a silent UDP peer.
+        sync::this_thread::sleep_for(sync::milliseconds_from(WAIT_GRANULARITY_MS));
+        w_packet.setLength(-1);
+        return RST_AGAIN;
     }
 
     const SRT_VTWAIT wt = m_VTConfig.waitread(m_VTConfig.opaq, WAIT_GRANULARITY_MS);
@@ -1327,12 +1351,21 @@ EReadStatus CChannelVirtual::recvfrom(sockaddr_any& w_addr, CPacket& w_packet) c
 
     if (wt != SRT_VTWAIT_READY)
     {
-        // SRT_VTWAIT_BROKEN: the medium can no longer carry datagrams.
-        // Like an unrecoverable recvmsg() error in the UDP channel, this
-        // makes the receive worker exit, which breaks the connection.
+        // SRT_VTWAIT_BROKEN, or a garbage enum value: the medium can no
+        // longer carry datagrams. The state turns broken once, with a
+        // visible report - from now on no callback of this configuration
+        // runs again, and the connections do not break here: the receive
+        // worker keeps servicing the multiplexer through the paced
+        // RST_AGAIN above, and every socket breaks through the peer-idle
+        // timeout (SRTO_PEERIDLETIMEO), the same way a UDP connection
+        // breaks when the peer goes silent.
         m_bBroken = true;
+        LOGC(krlog.Error,
+             log << CONID() << "CHANNEL: VIRTUAL transport: the medium broke (waitread report: "
+                 << (int) wt << "); no transport callback will run again, connections break by the peer-idle timeout");
+        sync::this_thread::sleep_for(sync::milliseconds_from(WAIT_GRANULARITY_MS));
         w_packet.setLength(-1);
-        return RST_ERROR;
+        return RST_AGAIN;
     }
 
     // The buffers that recvmsg() in the UDP channel would scatter the

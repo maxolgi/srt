@@ -587,8 +587,12 @@ at most the requested number of milliseconds with the readiness state of the
 medium: `SRT_VTWAIT_READY` (a datagram is ready to be picked by `deliver`),
 `SRT_VTWAIT_TIMEOUT` (no datagram within the given time; it will be called
 again) or `SRT_VTWAIT_BROKEN`. `SRT_VTWAIT_BROKEN` reports that the medium can
-no longer carry datagrams; this terminates the receive worker and thereby breaks
-the connection.
+no longer carry datagrams. After it is returned once, SRT invokes no callback of
+the configuration again; the sockets using it break through the peer-idle
+timeout ([`SRTO_PEERIDLETIMEO`](API-socket-options.md#SRTO_PEERIDLETIMEO),
+default 5 s), the same way a UDP connection breaks when the peer goes silent,
+and the receive worker keeps servicing the multiplexer until every socket is
+closed.
 
 * `deliver`: invoked only after `waitread` returned `SRT_VTWAIT_READY`, to pick
 up one pending datagram. The datagram is scattered into the provided
