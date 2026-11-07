@@ -24,6 +24,9 @@
 #include <cstddef>
 #include <deque>
 #include <mutex>
+// <sys/socket.h> is fine here: this header is part of the srttransport
+// helper, built only with ENABLE_VIRTUAL_TRANSPORT (Linux and Emscripten
+// only, enforced in CMakeLists.txt), so POSIX definitions always exist.
 #include <sys/socket.h>
 #include <vector>
 

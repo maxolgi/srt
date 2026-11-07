@@ -364,10 +364,12 @@ option(ENABLE_AEAD "Enable AEAD API preview in SRT" ON)
 option(ENABLE_MAXREXMITBW "Enable SRTO_MAXREXMITBW (limiting rexmit bandwidth)" ON)
 option(ENABLE_VIRTUAL_TRANSPORT "Enable the virtual transport seam: sockets exchanging datagrams through an owner-supplied transport instead of an OS UDP socket (Linux and Emscripten)" OFF)
 
-# The srtcore seam of the virtual transport is C++98-clean, but the
-# Emscripten build compiles the srttransport helper (std::mutex,
-# std::condition_variable) against the library, so it needs at least C++11.
-# Scoped to Emscripten: a plain Linux build keeps the stock standard.
+# The srtcore seam is C++98-clean; the srttransport helper needs C++11
+# but carries its own per-target standard (srt_set_stdcxx(srttransport
+# 11)), so a plain Linux build keeps the stock library standard. Under
+# Emscripten one standard drives every target (USE_CXX_STD 11+ sets the
+# global CMAKE_CXX_STANDARD) and the below-11 mix is exercised only by
+# the Linux CI legs, so the floor there is global: default 11, reject lower.
 # Must run before the USE_CXX_STD processing below.
 if (ENABLE_VIRTUAL_TRANSPORT AND EMSCRIPTEN)
 	if (DEFINED USE_CXX_STD)
