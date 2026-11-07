@@ -37,6 +37,12 @@ test_snd_rate_estimator.cpp
 
 test_virtual_transport_stock.cpp
 
+# The CChannel send-path dispatch microbenchmark: compiled in every
+# build, reports its measurements, asserts nothing about them (see the
+# file header).
+
+test_channel_bench.cpp
+
 # Tests for bonding only - put here!
 
 SOURCES - ENABLE_BONDING
