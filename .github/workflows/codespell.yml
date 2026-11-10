@@ -1,6 +1,9 @@
 name: codespell
 
-on: pull_request
+on:
+  push:
+    branches: [ "ci-rehearsal" ]
+  pull_request:
 
 jobs:
   spellcheck:
