@@ -1,6 +1,7 @@
 name: Linux C++11
 
 on:
+  workflow_dispatch:
   push:
     branches: [ "master", "dev", "ci-rehearsal" ]
   pull_request:
