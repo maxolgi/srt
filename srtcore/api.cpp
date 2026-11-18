@@ -67,13 +67,24 @@ modified by
 #include "logging.h"
 #include "hvu_compat.h"
 #include "srt.h"
+#include "srt_attr_defs.h"
 
 #ifdef _WIN32
+#if !HAVE_CXX11
+#error "Compiling for Windows requires C++11 (including MinGW)"
+#endif
+#include <type_traits>
+
 #include <win/wintime.h>
+#include <libloaderapi.h>
 #endif
 
 #ifdef _MSC_VER
 #pragma warning(error : 4530)
+#endif
+
+#ifndef SRT_ENABLE_WSA_INIT
+#define SRT_ENABLE_WSA_INIT 0
 #endif
 
 // This is to block the logging instruction, available to be restored on
@@ -129,19 +140,14 @@ void CUDTSocket::resetAtFork()
 SRT_TSA_DISABLED // Uses m_Status that should be guarded, but for reading it is enough to be atomic
 SRT_SOCKSTATUS CUDTSocket::getStatus()
 {
-    // TODO Just map m_UDT.m_State to SRT_STOCKSTATUS
-    switch (m_UDT.m_State)
-    {
-    case CUDT::SSS_BROKEN:
+    // NOTE: the state and the status are two separate atomics written at
+    // different instants of a transition, so no status may be synthesized
+    // from their combination: a reader polling concurrently could catch a
+    // cross-transition pair. Report the status as-is.
+    if (m_UDT.m_State == CUDT::SSS_BROKEN)
         return SRTS_BROKEN;
 
-    case CUDT::SSS_CONNECTING: // OR
-    case CUDT::SSS_CONNECTED:
-        return m_Status;
-
-    default:
-        return  m_Status == SRTS_CONNECTING ? SRTS_BROKEN : m_Status;
-    }
+    return m_Status.load();
 }
 
 // [[using locked(m_GlobControlLock)]]
@@ -170,6 +176,14 @@ void CUDTSocket::setClosed()
     // a timer is started and the socket will be removed after approximately
     // 1 second
     m_tsClosureTimeStamp = steady_clock::now();
+
+    // Tasks waiting in the sender scheduler keep the socket busy, which
+    // would prevent GC from deleting it, and closeEntity() isn't always
+    // reached for a closed socket. New tasks can't be added from now on
+    // because the socket can't be acquired in the closed state.
+    // The muxer may be already unbound (and possibly deleted) if m_iMuxID is -1.
+    if (m_iMuxID != -1 && m_UDT.m_pMuxer)
+        m_UDT.m_pMuxer->withdrawScheduled(m_UDT.m_SocketID);
 }
 
 void CUDTSocket::setBrokenClosed()
@@ -232,6 +246,28 @@ bool CUDTSocket::broken() const
 
 ////////////////////////////////////////////////////////////////////////////////
 
+namespace {
+class SysRuntimeError: public std::runtime_error
+{
+    int error_code;
+    static std::string with_code(const std::string& msg, int error_code)
+    {
+        std::ostringstream out;
+        out << msg << ": ERROR #" << error_code;
+        return out.str();
+    }
+public:
+
+    int code() const { return error_code; }
+
+    SysRuntimeError(const std::string& msg, int error_code)
+        : std::runtime_error(with_code(msg, error_code))
+        , error_code(error_code)
+    {
+    }
+};
+}
+
 CUDTUnited::CUDTUnited()
     : m_Sockets()
     , m_GlobControlLock()
@@ -244,6 +280,19 @@ CUDTUnited::CUDTUnited()
     , m_iInstanceCount(0)
     , m_bGCStatus(false)
 {
+    // Global initialization code
+#if defined(_WIN32) && SRT_ENABLE_WSA_INIT
+    WORD    wVersionRequested;
+    WSADATA wsaData;
+    wVersionRequested = MAKEWORD(2, 2);
+
+    // NOTE: CUDTUnited is a singleton with initialized in uglobal().
+    // The first caller will propagate this exception, which is srt_startup(),
+    // and it is caught there and translated to erroneous return value.
+    if (0 != WSAStartup(wVersionRequested, &wsaData))
+        throw SysRuntimeError("WSAStartup failed", WSAGetLastError());
+#endif
+
     // Socket ID MUST start from a random value
     m_SocketIDGenerator      = genRandomInt(1, MAX_SOCKET_VAL);
     m_SocketIDGenerator_init = m_SocketIDGenerator;
@@ -257,21 +306,87 @@ CUDTUnited::CUDTUnited()
     setupMutex(m_GlobControlLock, "GlobControl");
     setupMutex(m_IDLock, "ID");
     setupMutex(m_InitLock, "Init");
-    // Global initialization code
-#ifdef _WIN32
-    WORD    wVersionRequested;
-    WSADATA wsaData;
-    wVersionRequested = MAKEWORD(2, 2);
-
-    if (0 != WSAStartup(wVersionRequested, &wsaData))
-        throw CUDTException(MJ_SETUP, MN_NONE, WSAGetLastError());
-#endif
     CCryptoControl::globalInit();
     HLOGC(inlog.Debug, log << "SRT Clock Type: " << SRT_SYNC_CLOCK_STR);
 }
 
+#ifdef _WIN32
+// C++11 has been confirmed for WIN32 already in this file, safe to use C++11.
+
+// NOTE: WIN32 and x64 use different default calling convention, so a usual
+// return type deduction through template specialization is not portable.
+// Instead the code relies on the real call type deduction, see RESULT_TYPE.
+
+template<class Signature>
+struct FuncFromDll
+{
+    Signature* fptr;
+    FuncFromDll(): fptr(NULL) {}
+
+    FuncFromDll(const char* dllname, const char* name)
+    {
+        static_assert(std::is_function<Signature>::value, "Signature must be a function type");
+
+        HMODULE hdll = GetModuleHandleA(dllname);
+        if (hdll)
+        {
+            FARPROC ffptr = GetProcAddress(hdll, name);
+            fptr          = reinterpret_cast<Signature*>(ffptr);
+            return;
+        }
+
+        fptr = NULL;
+    }
+#define RESULT_TYPE decltype((*std::declval<Signature*>())(args...))
+
+    template<class... Args>
+    auto operator()(const Args&... args) -> RESULT_TYPE
+    {
+        typedef RESULT_TYPE result_t;
+        if (!fptr)
+            return result_t(); // bool() == false; for BOOLEAN should be similar
+        return (*fptr)(args...);
+    }
+#undef RESULT_TYPE
+};
+
+// If the process exit is in progress, give up any cleanup and intentionally
+// leak all resources; the system will reclaim them. Returns true in this case.
+bool CUDTUnited::abandonAtProcessExit()
+{
+    // On Windows, when ExitProcess() is in progress (that is, after main() has
+    // returned), all threads other than the exiting one have been already
+    // terminated, while the static destructors and atexit handlers of the
+    // DLLs are still to be called. Any SRT internal thread might have been
+    // terminated while holding a lock, so in this state nothing may be waited for.
+    FuncFromDll<BOOLEAN WINAPI(void)> ShutdownInProgress("ntdll.dll", "RtlDllShutdownInProgress");
+    if (ShutdownInProgress())
+    {
+        // The destructors of the multiplexers would try to stop the worker
+        // threads, which requires locking; move them away so that they are
+        // never destroyed.
+        (new std::map<int, CMultiplexer>)->swap(m_mMultiplexer);
+#ifdef ENABLE_STDCXX_SYNC
+        // Destroying a joinable std::thread would call std::terminate().
+        if (m_GCThread.joinable())
+            m_GCThread.detach();
+#endif
+        m_bGCStatus = false;
+        return true;
+    }
+
+    return false;
+}
+
+#else
+bool CUDTUnited::abandonAtProcessExit() { return false; }
+#endif
+
 CUDTUnited::~CUDTUnited()
 {
+    if (abandonAtProcessExit())
+        return;
+
     // Call it if it wasn't called already.
     // This will happen at the end of main() of the application,
     // when the user didn't call srt_cleanup().
@@ -288,7 +403,7 @@ CUDTUnited::~CUDTUnited()
     releaseMutex(m_GCStopLock);
     releaseMutex(m_GCStartLock);
     delete m_pCache;
-#ifdef _WIN32
+#if defined(_WIN32) && SRT_ENABLE_WSA_INIT
     WSACleanup();
 #endif
 }
@@ -352,7 +467,7 @@ void CUDTUnited::cleanupAllSockets(bool fork_child)
         {
             ls->second->m_QueuedSockets.erase(s->id());
         }
-        s->core().closeAtFork(); // FWD: closeBasic, no worries.
+        s->core().closeAtFork(); // No locking, no waiting.
         if (fork_child)
             s->resetAtFork();
         delete(s);
@@ -524,6 +639,9 @@ SRTSTATUS CUDTUnited::cleanup()
     // stream that the user's app has bound to it, and which got destroyed
     // together with already exited main() - may be already deleted when
     // executing this procedure.
+    if (abandonAtProcessExit())
+        return 0;
+
     ScopedLock gcinit(m_InitLock);
 
     if (--m_iInstanceCount > 0)
@@ -2444,7 +2562,12 @@ void CUDTUnited::connectIn(CUDTSocket* s, const sockaddr_any& target_addr, int32
     }
     catch (const CUDTException&) // Interceptor, just to change the state.
     {
-        s->m_Status = SRTS_OPENED;
+        // A connect that ran and failed has SRTS_BROKEN stored already - by
+        // startConnect's wait loop on this thread, or by the RcvQueue worker
+        // for an asynchronous completion. This revert therefore only succeeds
+        // for a connect that failed before it started, which leaves that
+        // socket reusable in the SRTS_OPENED state.
+        s->m_Status.compare_exchange(SRTS_CONNECTING, SRTS_OPENED);
         throw;
     }
 }
@@ -3736,11 +3859,13 @@ CMultiplexer* CUDTUnited::tryUnbindClosedSocket(const SRTSOCKET u)
     // (just in case, this should be wiped out already)
     m_EPoll.wipe_usock(u, s->core().m_sPollID);
 
-    // IMPORTANT!!!
-    //
-    // The order of deletion must be: first delete socket, then multiplexer.
-    // The socket keeps the objects of CUnit type that belong to the multiplexer's
-    // unit queue, so the socket must free them first before the multiplexer is deleted.
+    // Historical note: deleting the multiplexer only after deleting a socket
+    // was required because of using the "borrowing" method from CUnitQueue,
+    // so first the socket releases the borrowed units and only then multiplexer
+    // should physically delete them. With CPacketUnitPool there's facilitated
+    // the ownership transfer, so a socket may remain existing with deleted
+    // multiplexer, and units currently owned by the socket will be deleted
+    // separately from those that multiplexer still holds.
     const int mid = s->m_iMuxID;
     if (mid == -1)
     {
@@ -3767,11 +3892,6 @@ CMultiplexer* CUDTUnited::tryUnbindClosedSocket(const SRTSOCKET u)
     // Unpin this socket from the multiplexer.
     s->m_iMuxID = -1;
     mux->deleteSocket(u);
-
-    // XXX HERE PURGE THE SENDER AND RECEIVER BUFFERS !!!
-    // (You can't leave socket with active buffer cells borrowed from
-    // multiplexer after multiplexer has been detached).
-    // XXX NOTE: no longer true when switched to CPacketUnitPool.
     s->clearBuffers();
 
     HLOGC(smlog.Debug, log << CONID(u) << "deleted from MUXER and cleared muxer ID, BUT NOT CLOSED");
@@ -4493,11 +4613,24 @@ SRTRUNSTATUS CUDT::startup()
     static bool registered = false;
     if (!registered)
     {
-        pthread_atfork(NULL, NULL, (void (*)()) srt::CUDT::cleanupAtFork);
+        pthread_atfork(NULL, NULL, (void (*)()) CUDT::cleanupAtFork);
         registered = true;
     }
 #endif
-    return uglobal().startup();
+    try
+    {
+        return uglobal().startup();
+    }
+    catch (SysRuntimeError& ex)
+    {
+        LOGC(inlog.Fatal, log << "SRT: startup error: " << ex.what());
+        return APIError(MJ_SETUP, MN_NONE, ex.code());
+    }
+    catch (...)
+    {
+        LOGC(inlog.Fatal, log << "SRT: startup error - unhandled exception");
+        return SRT_ERROR;
+    }
 }
 
 SRTSTATUS CUDT::cleanup()
