@@ -30,6 +30,7 @@ test_utilities.cpp
 test_reuseaddr.cpp
 test_socketdata.cpp
 test_snd_rate_estimator.cpp
+test_sockstate_race.cpp
 
 # Virtual transport API stock-build rejection tests: compiled in every
 # build, their tests exist only when the feature is compiled out (see the
